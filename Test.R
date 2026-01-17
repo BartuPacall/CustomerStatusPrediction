@@ -1,0 +1,922 @@
+## =========================================================
+## 0) Setup
+## =========================================================
+rm(list = ls())
+set.seed(42)
+
+PROJECT_DIR <- "C:/Users/Bartu/Desktop/Customer_Status_Prediction"
+DATA_DIR <- file.path(PROJECT_DIR, "Test Datasets")
+
+library(dplyr)
+library(tidyr)
+library(caret)
+library(ggplot2)
+library(randomForest)
+library(nnet)
+library(gbm)
+
+cat("=========================================================\n")
+cat("CUSTOMER STATUS PREDICTION - TEST PHASE\n")
+cat("=========================================================\n")
+
+## =========================================================
+## 1) Load Train Models
+## =========================================================
+cat("\nLoading train models...\n")
+
+if (!file.exists(file.path(PROJECT_DIR, "train_models_final.RData"))) {
+  stop("ERROR: train_models_final.RData not found! Run train.R script first.")
+}
+
+load(file.path(PROJECT_DIR, "train_models_final.RData"))
+
+cat("Models loaded:\n")
+cat("   - Random Forest:", ifelse(exists("rf_model"), "OK", "X"), "\n")
+cat("   - Logistic Regression:", ifelse(exists("log_model"), "OK", "X"), "\n")
+cat("   - GBM:", ifelse(exists("gbm_model"), "OK", "X"), "\n")
+cat("   - Dummies object:", ifelse(exists("dummies"), "OK", "X"), "\n")
+
+## =========================================================
+## 2) Read Test Data
+## =========================================================
+cat("\nReading test data...\n")
+
+read_test_file <- function(file_name) {
+  read.csv(file.path(DATA_DIR, file_name), stringsAsFactors = FALSE)
+}
+
+test_files <- list(
+  status = "customer_status_level_test.csv",
+  demographics = "customer_demographics_test.csv",
+  revenue = "customer_monthly_recurring_revenue_test.csv",
+  region = "customer_region_and_industry_test.csv",
+  history = "customer_revenue_history_test.csv",
+  satisfaction = "customer_satisfaction_scores_test.csv",
+  engagement = "newsletter_engagement_test.csv",
+  bug = "product_bug_reports_test.csv",
+  ticket = "support_ticket_activity_test.csv"
+)
+
+# Read all test files
+test_data <- lapply(test_files, read_test_file)
+names(test_data) <- c(
+  "Customer_Status_Test", "Customer_Demographics_Test", "Customer_Revenue_Test",
+  "Customer_Region_Industry_Test", "Customer_Revenue_History_Test",
+  "Customer_Satisfaction_Test", "Customer_Engagement_Test",
+  "Customer_Bug_Reports_Test", "Customer_Ticket_Activity_Test"
+)
+
+# Assign to global environment
+list2env(test_data, envir = .GlobalEnv)
+cat("Test files loaded.\n")
+
+## =========================================================
+## 3) ID Column Standardization and Status Removal
+## =========================================================
+cat("\nData preparation...\n")
+
+# Check column names in Customer_Status_Test
+cat("Checking Customer_Status_Test columns:\n")
+print(names(Customer_Status_Test))
+
+# Check if Status column exists in test data
+if ("Status" %in% names(Customer_Status_Test)) {
+  # Save Customer.Level for merging
+  if ("Customer.Level" %in% names(Customer_Status_Test)) {
+    customer_level_backup <- Customer_Status_Test %>%
+      select(Customer.ID, Customer.Level)
+    cat("Customer.Level saved for merging.\n")
+  }
+  
+  # Remove Status column (target variable)
+  Customer_Status_Test <- Customer_Status_Test %>%
+    select(-Status)
+  cat("Status column removed (target variable).\n")
+} else {
+  cat("Note: Status column not found in test data (expected).\n")
+  
+  # Still check for Customer.Level
+  if ("Customer.Level" %in% names(Customer_Status_Test)) {
+    customer_level_backup <- Customer_Status_Test %>%
+      select(Customer.ID, Customer.Level)
+    cat("Customer.Level saved for merging.\n")
+  }
+}
+
+# Standardize ID column
+if ("CUS.ID" %in% names(Customer_Demographics_Test)) {
+  Customer_Demographics_Test <- Customer_Demographics_Test %>% 
+    rename(Customer.ID = CUS.ID)
+  cat("ID column standardized.\n")
+}
+
+## =========================================================
+## 4) Aggregation - Same as Train
+## =========================================================
+cat("\nTest data aggregation...\n")
+
+# Helper function for mode
+get_mode_chr <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_character_)
+  tb <- sort(table(x), decreasing = TRUE)
+  names(tb)[1]
+}
+
+## 4.1 Bug Reports Aggregation
+Customer_Bug_Reports_Test_Agg <- Customer_Bug_Reports_Test %>%
+  group_by(Customer.ID) %>%
+  summarise(
+    Total_Bug_Count = sum(Product.Bug.Task.Count, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+## 4.2 Satisfaction Aggregation
+# Check column names first
+cat("Original Customer_Satisfaction_Test columns:\n")
+print(names(Customer_Satisfaction_Test))
+
+# Standardize column names
+if (ncol(Customer_Satisfaction_Test) >= 11) {
+  names(Customer_Satisfaction_Test)[1:11] <- c(
+    "Customer.ID", "Year", "Quarter", "Survey_Date", "Response_Date",
+    "NPS", "Value_Score", "Usage_Freq", "Quality_Score",
+    "Usability_Score", "Reporting_Score"
+  )
+  
+  Customer_Satisfaction_Test <- Customer_Satisfaction_Test %>%
+    mutate(
+      Survey_Date = as.Date(Survey_Date),
+      Response_Date = as.Date(Response_Date)
+    )
+  
+  # Get last survey records
+  last_rows_test <- Customer_Satisfaction_Test %>%
+    mutate(last_date = coalesce(Survey_Date, Response_Date)) %>%
+    arrange(Customer.ID, last_date) %>%
+    group_by(Customer.ID) %>%
+    slice_tail(n = 1) %>%
+    ungroup() %>%
+    select(Customer.ID, Year, Quarter, Survey_Date, Response_Date)
+  
+  # Aggregate satisfaction data
+  Customer_Satisfaction_Test_Agg <- Customer_Satisfaction_Test %>%
+    group_by(Customer.ID) %>%
+    summarise(
+      NPS_mean = mean(NPS, na.rm = TRUE),
+      Value_mean = mean(Value_Score, na.rm = TRUE),
+      Quality_mean = mean(Quality_Score, na.rm = TRUE),
+      Usability_mean = mean(Usability_Score, na.rm = TRUE),
+      Reporting_score = get_mode_chr(Reporting_Score),
+      Usage_Freq = get_mode_chr(Usage_Freq),
+      Survey_count = n(),
+      .groups = "drop"
+    ) %>%
+    left_join(
+      last_rows_test %>%
+        rename(
+          Year_Last = Year,
+          Quarter_Last = Quarter,
+          Last_Survey_Date = Survey_Date,
+          Last_Response_Date = Response_Date
+        ),
+      by = "Customer.ID"
+    )
+} else {
+  cat("Warning: Customer_Satisfaction_Test has unexpected number of columns\n")
+  Customer_Satisfaction_Test_Agg <- data.frame(Customer.ID = unique(Customer_Satisfaction_Test$Customer.ID))
+}
+
+## 4.3 Ticket Activity Aggregation
+if ("Customer.ID" %in% names(Customer_Ticket_Activity_Test)) {
+  Customer_Ticket_Activity_Test_Agg <- if (sum(duplicated(Customer_Ticket_Activity_Test$Customer.ID)) > 0) {
+    Customer_Ticket_Activity_Test %>%
+      group_by(Customer.ID) %>%
+      summarise(
+        Help.Ticket.Count = sum(Help.Ticket.Count, na.rm = TRUE),
+        Help.Ticket.Lead.Time..hours. = mean(Help.Ticket.Lead.Time..hours., na.rm = TRUE),
+        .groups = "drop"
+      )
+  } else {
+    Customer_Ticket_Activity_Test
+  }
+} else {
+  cat("Warning: Customer.ID not found in Ticket Activity data\n")
+  Customer_Ticket_Activity_Test_Agg <- data.frame()
+}
+
+## 4.4 Newsletter Engagement Aggregation
+if ("Customer.ID" %in% names(Customer_Engagement_Test)) {
+  Customer_Engagement_Test_Agg <- if (sum(duplicated(Customer_Engagement_Test$Customer.ID)) > 0) {
+    Customer_Engagement_Test %>%
+      group_by(Customer.ID) %>%
+      summarise(
+        Company.Newsletter.Interaction.Count = sum(Company.Newsletter.Interaction.Count, na.rm = TRUE),
+        .groups = "drop"
+      )
+  } else {
+    Customer_Engagement_Test
+  }
+} else {
+  cat("Warning: Customer.ID not found in Engagement data\n")
+  Customer_Engagement_Test_Agg <- data.frame()
+}
+
+cat("Aggregation completed.\n")
+
+## =========================================================
+## 5) Merge Test Data
+## =========================================================
+cat("\nMerging test data...\n")
+
+# Start with Customer_Status_Test
+master_test <- Customer_Status_Test
+
+# List of dataframes to merge
+data_to_merge <- list(
+  Customer_Demographics_Test,
+  Customer_Revenue_Test,
+  Customer_Region_Industry_Test,
+  Customer_Revenue_History_Test,
+  Customer_Satisfaction_Test_Agg,
+  Customer_Engagement_Test_Agg,
+  Customer_Bug_Reports_Test_Agg,
+  Customer_Ticket_Activity_Test_Agg
+)
+
+# Merge all dataframes
+for (i in seq_along(data_to_merge)) {
+  df_name <- c("Demographics", "Revenue", "Region_Industry", "Revenue_History",
+               "Satisfaction", "Engagement", "Bug_Reports", "Ticket_Activity")[i]
+  
+  if (nrow(data_to_merge[[i]]) > 0 && "Customer.ID" %in% names(data_to_merge[[i]])) {
+    master_test <- master_test %>%
+      left_join(data_to_merge[[i]], by = "Customer.ID")
+    cat("Merged:", df_name, "\n")
+  } else {
+    cat("Skipped:", df_name, "(no data or missing Customer.ID)\n")
+  }
+}
+
+cat("Test data merged. Total customers:", nrow(master_test), "\n")
+
+if (exists("customer_level_backup")) {
+  cat("Customer.Level column preserved.\n")
+}
+
+## =========================================================
+## 6) Basic Cleaning - Same as Train
+## =========================================================
+cat("\nTest data cleaning...\n")
+
+# Clean currency columns
+currency_columns <- c("MRR", "Total.Revenue")
+for (col in currency_columns) {
+  if (col %in% colnames(master_test)) {
+    master_test[[col]] <- as.numeric(gsub("[\\$,]", "", as.character(master_test[[col]])))
+    cat("Cleaned currency column:", col, "\n")
+  }
+}
+
+# Factor conversions
+factor_columns <- c("Region", "Customer.Level", "Vertical", "Subvertical", 
+                    "Usage_Freq", "Reporting_score")
+for (col in factor_columns) {
+  if (col %in% colnames(master_test)) {
+    master_test[[col]] <- as.factor(master_test[[col]])
+    cat("Converted to factor:", col, "\n")
+  }
+}
+
+# Date conversions
+date_columns <- c("Last_Survey_Date", "Last_Response_Date")
+for (col in date_columns) {
+  if (col %in% colnames(master_test)) {
+    master_test[[col]] <- as.Date(master_test[[col]])
+    cat("Converted to date:", col, "\n")
+  }
+}
+
+cat("Basic cleaning completed.\n")
+
+## =========================================================
+## 7) Feature Engineering - Identical to Train
+## =========================================================
+cat("\nFeature Engineering - Test Data...\n")
+
+# 7.1 Missing value handling
+if ("MRR" %in% colnames(master_test)) {
+  master_test$MRR_na_flag <- as.integer(is.na(master_test$MRR))
+  master_test$MRR[is.na(master_test$MRR)] <- 0
+  cat("Processed MRR missing values\n")
+}
+
+if ("Total.Revenue" %in% colnames(master_test)) {
+  master_test$Total.Revenue_na_flag <- as.integer(is.na(master_test$Total.Revenue))
+  master_test$Total.Revenue[is.na(master_test$Total.Revenue)] <- 0
+  cat("Processed Total.Revenue missing values\n")
+}
+
+if ("Customer.Age..Months." %in% colnames(master_test)) {
+  master_test$Customer.Age..Months.[is.na(master_test$Customer.Age..Months.)] <- 
+    median(master_test$Customer.Age..Months., na.rm = TRUE)
+  cat("Processed Customer.Age..Months. missing values\n")
+}
+
+# 7.2 Survey scores
+if ("NPS_mean" %in% colnames(master_test)) {
+  master_test$has_survey <- ifelse(is.na(master_test$NPS_mean), 0, 1)
+  cat("Created has_survey flag\n")
+}
+
+survey_vars <- c("NPS_mean", "Value_mean", "Quality_mean", "Usability_mean")
+for (var in survey_vars) {
+  if (var %in% colnames(master_test)) {
+    master_test[[var]][is.na(master_test[[var]])] <- median(master_test[[var]], na.rm = TRUE)
+    cat("Imputed missing values for:", var, "\n")
+  }
+}
+
+# 7.3 Categorical NA -> "None"
+if ("Reporting_score" %in% colnames(master_test)) {
+  master_test <- master_test %>%
+    mutate(
+      Reporting_score = replace_na(as.character(Reporting_score), "None")
+    )
+  cat("Processed Reporting_score NA values\n")
+}
+
+if ("Usage_Freq" %in% colnames(master_test)) {
+  master_test <- master_test %>%
+    mutate(
+      Usage_Freq = replace_na(as.character(Usage_Freq), "None")
+    )
+  cat("Processed Usage_Freq NA values\n")
+}
+
+# 7.4 Survey_count NA -> 0
+if ("Survey_count" %in% colnames(master_test)) {
+  master_test$Survey_count[is.na(master_test$Survey_count)] <- 0
+  cat("Processed Survey_count NA values\n")
+}
+
+# 7.5 Response delay
+if (all(c("Last_Response_Date", "Last_Survey_Date") %in% colnames(master_test))) {
+  master_test$no_response_flag <- ifelse(
+    is.na(master_test$Last_Response_Date) | is.na(master_test$Last_Survey_Date), 1, 0
+  )
+  
+  master_test$response_delay_days <- as.numeric(master_test$Last_Response_Date - master_test$Last_Survey_Date)
+  master_test$response_delay_days[is.na(master_test$response_delay_days)] <- 0
+  master_test$response_delay_days[master_test$response_delay_days < 0] <- 0
+  cat("Created response delay features\n")
+}
+
+# 7.6 Newsletter / bug / ticket flags
+if ("Company.Newsletter.Interaction.Count" %in% colnames(master_test)) {
+  master_test$has_newsletter_interaction <- ifelse(is.na(master_test$Company.Newsletter.Interaction.Count), 0, 1)
+  master_test$Company.Newsletter.Interaction.Count[is.na(master_test$Company.Newsletter.Interaction.Count)] <- 0
+  cat("Processed newsletter features\n")
+}
+
+if ("Total_Bug_Count" %in% colnames(master_test)) {
+  master_test$has_bug_report <- ifelse(is.na(master_test$Total_Bug_Count), 0, 1)
+  master_test$Total_Bug_Count[is.na(master_test$Total_Bug_Count)] <- 0
+  cat("Processed bug report features\n")
+}
+
+if ("Help.Ticket.Count" %in% colnames(master_test)) {
+  master_test$has_ticket <- ifelse(is.na(master_test$Help.Ticket.Count), 0, 1)
+  master_test$Help.Ticket.Count[is.na(master_test$Help.Ticket.Count)] <- 0
+  cat("Processed ticket features\n")
+}
+
+if ("Help.Ticket.Lead.Time..hours." %in% colnames(master_test)) {
+  master_test$Help.Ticket.Lead.Time..hours.[is.na(master_test$Help.Ticket.Lead.Time..hours.)] <- 0
+  cat("Processed ticket lead time\n")
+}
+
+# 7.7 New features - IDENTICAL to TRAIN
+cat("\nCreating new features...\n")
+
+# 1) Satisfaction Composite Score
+if (all(c("NPS_mean", "Value_mean", "Quality_mean", "Usability_mean") %in% colnames(master_test))) {
+  master_test$Satisfaction_Composite <- rowMeans(
+    master_test[, c("NPS_mean", "Value_mean", "Quality_mean", "Usability_mean")],
+    na.rm = TRUE
+  )
+  cat("Created Satisfaction_Composite feature\n")
+}
+
+# 2) Support Burden
+if (all(c("Help.Ticket.Count", "Help.Ticket.Lead.Time..hours.") %in% colnames(master_test))) {
+  master_test$Support_Burden <- master_test$Help.Ticket.Count * 
+    ifelse(master_test$Help.Ticket.Lead.Time..hours. > 0, 
+           master_test$Help.Ticket.Lead.Time..hours., 1)
+  cat("Created Support_Burden feature\n")
+}
+
+# 3) Revenue Efficiency
+if (all(c("Total.Revenue", "Customer.Age..Months.") %in% colnames(master_test))) {
+  master_test$Revenue_per_Month <- ifelse(
+    master_test$Customer.Age..Months. > 0,
+    master_test$Total.Revenue / master_test$Customer.Age..Months.,
+    0
+  )
+  cat("Created Revenue_per_Month feature\n")
+}
+
+# 4) Bug Frequency
+if (all(c("Total_Bug_Count", "Customer.Age..Months.") %in% colnames(master_test))) {
+  master_test$Bug_Frequency <- ifelse(
+    master_test$Customer.Age..Months. > 0,
+    master_test$Total_Bug_Count / master_test$Customer.Age..Months.,
+    0
+  )
+  cat("Created Bug_Frequency feature\n")
+}
+
+# 5) Engagement Ratio
+if (all(c("Company.Newsletter.Interaction.Count", "Customer.Age..Months.") %in% colnames(master_test))) {
+  master_test$Engagement_Ratio <- ifelse(
+    master_test$Customer.Age..Months. > 0,
+    master_test$Company.Newsletter.Interaction.Count / master_test$Customer.Age..Months.,
+    0
+  )
+  cat("Created Engagement_Ratio feature\n")
+}
+
+# 6) MRR to Total Revenue Ratio
+if (all(c("MRR", "Total.Revenue") %in% colnames(master_test))) {
+  master_test$MRR_Ratio <- ifelse(
+    master_test$Total.Revenue > 0,
+    master_test$MRR / master_test$Total.Revenue,
+    0
+  )
+  cat("Created MRR_Ratio feature\n")
+}
+
+cat("Feature engineering completed.\n")
+
+## =========================================================
+## 8) Prepare Data for Model
+## =========================================================
+cat("\nPreparing data for model...\n")
+
+# Save Customer IDs for submission
+test_customer_ids <- master_test$Customer.ID
+
+# Remove ID and date variables
+master_test_model <- master_test %>%
+  select(-Customer.ID)
+
+# Remove date variables if they exist
+date_vars <- c("Last_Survey_Date", "Last_Response_Date")
+master_test_model <- master_test_model %>%
+  select(-any_of(date_vars))
+
+# Remove variables that were removed in train
+variables_to_remove <- c(
+  "NPS_mean", "Value_mean", "Quality_mean", "Usability_mean",
+  "Help.Ticket.Count", "Help.Ticket.Lead.Time..hours."
+)
+
+master_test_model <- master_test_model %>%
+  select(-any_of(variables_to_remove))
+
+# Check if cat_cols exists (from loaded train data)
+if (!exists("cat_cols")) {
+  # Define default categorical columns if not loaded
+  cat_cols <- c("Region", "Customer.Level", "Vertical", "Subvertical", "Usage_Freq", "Reporting_score")
+  cat("Note: cat_cols not loaded, using default values\n")
+}
+
+# Convert categorical variables to factor
+for (col in cat_cols) {
+  if (col %in% colnames(master_test_model)) {
+    master_test_model[[col]] <- as.factor(as.character(master_test_model[[col]]))
+  }
+}
+
+# Handle NA values
+na_summary_test <- sapply(master_test_model, function(x) sum(is.na(x)))
+na_vars_test <- names(na_summary_test[na_summary_test > 0])
+
+if (length(na_vars_test) > 0) {
+  cat("Warning: Variables with NA:", length(na_vars_test), "\n")
+  
+  numeric_vars_test <- sapply(master_test_model, is.numeric)
+  for (var in na_vars_test) {
+    if (numeric_vars_test[var]) {
+      master_test_model[[var]][is.na(master_test_model[[var]])] <- 
+        median(master_test_model[[var]], na.rm = TRUE)
+      cat("  -", var, ": NA values filled with median\n")
+    } else if (is.factor(master_test_model[[var]])) {
+      mode_val <- names(sort(table(master_test_model[[var]]), decreasing = TRUE))[1]
+      master_test_model[[var]][is.na(master_test_model[[var]])] <- mode_val
+      cat("  -", var, ": NA values filled with mode\n")
+    }
+  }
+}
+
+cat("\nTEST DATA SET READY:\n")
+cat("Number of rows:", nrow(master_test_model), "\n")
+cat("Number of columns:", ncol(master_test_model), "\n")
+cat("Number of NAs:", sum(is.na(master_test_model)), "\n")
+
+## =========================================================
+## 9) One-Hot Encoding
+## =========================================================
+cat("\nOne-Hot Encoding (Test)...\n")
+
+# Check if dummies object exists
+if (!exists("dummies")) {
+  stop("ERROR: dummies object not found in loaded RData file!")
+}
+
+test_dummy <- predict(dummies, newdata = master_test_model) %>% as.data.frame()
+
+test_final <- bind_cols(
+  master_test_model %>% select(-all_of(cat_cols)),
+  test_dummy
+)
+
+cat("Test size after one-hot encoding:", dim(test_final), "\n")
+
+# Check if train_final exists
+if (!exists("train_final")) {
+  stop("ERROR: train_final not found in loaded RData file!")
+}
+
+# Align columns with train
+train_cols <- setdiff(colnames(train_final), "Status")
+test_cols <- colnames(test_final)
+
+missing_in_test <- setdiff(train_cols, test_cols)
+extra_in_test <- setdiff(test_cols, train_cols)
+
+if (length(missing_in_test) > 0) {
+  cat("Warning: Missing columns in test:", length(missing_in_test), "\n")
+  for (col in missing_in_test) {
+    test_final[[col]] <- 0
+  }
+}
+
+if (length(extra_in_test) > 0) {
+  cat("Warning: Removing extra columns in test:", length(extra_in_test), "\n")
+  test_final <- test_final %>% select(-all_of(extra_in_test))
+}
+
+# Reorder columns to match train
+test_final <- test_final[, train_cols]
+
+cat("Test data ready for model.\n")
+cat("Final test dimensions:", dim(test_final), "\n")
+
+## =========================================================
+## 10) Predictions - 3 Models
+## =========================================================
+cat("\n", strrep("=", 60), "\n")
+cat("MAKING PREDICTIONS...\n")
+cat(strrep("=", 60), "\n")
+
+predictions_list <- list()
+
+# Helper function for predictions
+make_predictions <- function(model, model_name, newdata) {
+  cat("\n", model_name, "PREDICTIONS...\n")
+  if (exists(model) && !is.null(get(model))) {
+    tryCatch({
+      pred <- predict(get(model), newdata = newdata)
+      cat("???", model_name, "predictions completed.\n")
+      cat("Prediction distribution:\n")
+      print(table(pred))
+      return(pred)
+    }, error = function(e) {
+      cat("???", model_name, "prediction error:", e$message, "\n")
+      return(NULL)
+    })
+  } else {
+    cat("???", model_name, "model not found.\n")
+    return(NULL)
+  }
+}
+
+# 1) Random Forest
+predictions_list$RF <- make_predictions("rf_model", "RANDOM FOREST", test_final)
+
+# 2) Logistic Regression
+predictions_list$LogReg <- make_predictions("log_model", "LOGISTIC REGRESSION", test_final)
+
+# 3) GBM
+predictions_list$GBM <- make_predictions("gbm_model", "GBM", test_final)
+
+## =========================================================
+## 11) Create Submission Files
+## =========================================================
+cat("\n", strrep("=", 60), "\n")
+cat("CREATING SUBMISSION FILES...\n")
+cat(strrep("=", 60), "\n")
+
+for (model_name in names(predictions_list)) {
+  if (!is.null(predictions_list[[model_name]])) {
+    submission_df <- data.frame(
+      Customer.ID = test_customer_ids,
+      Status = predictions_list[[model_name]]
+    )
+    
+    filename <- paste0("submission_", model_name, ".csv")
+    write.csv(submission_df, 
+              file.path(PROJECT_DIR, filename), 
+              row.names = FALSE)
+    
+    cat("???", model_name, "submission saved:", filename, "\n")
+    cat("  Total predictions:", nrow(submission_df), "\n")
+  }
+}
+
+## =========================================================
+## 12) Ensemble - Voting
+## =========================================================
+cat("\nENSEMBLE PREDICTION (Majority Voting)...\n")
+
+# Use only successful models
+available_models <- names(predictions_list)[!sapply(predictions_list, is.null)]
+
+if (length(available_models) >= 2) {
+  # Put all predictions in a dataframe
+  ensemble_df <- data.frame(Customer.ID = test_customer_ids)
+  
+  for (model_name in available_models) {
+    ensemble_df[[model_name]] <- as.character(predictions_list[[model_name]])
+  }
+  
+  # Majority voting function
+  get_mode <- function(x) {
+    ux <- unique(x)
+    ux[which.max(tabulate(match(x, ux)))]
+  }
+  
+  ensemble_predictions <- apply(
+    ensemble_df[, available_models, drop = FALSE], 
+    1, 
+    get_mode
+  )
+  
+  # Ensemble submission
+  submission_ensemble <- data.frame(
+    Customer.ID = test_customer_ids,
+    Status = ensemble_predictions
+  )
+  
+  write.csv(submission_ensemble, 
+            file.path(PROJECT_DIR, "submission_ensemble.csv"), 
+            row.names = FALSE)
+  
+  cat("??? Ensemble submission saved: submission_ensemble.csv\n")
+  cat("Ensemble prediction distribution:\n")
+  print(table(ensemble_predictions))
+  
+  # Model agreement analysis
+  cat("\nMODEL AGREEMENT ANALYSIS:\n")
+  
+  if (length(available_models) == 3) {
+    # Agreement rate for all 3 models
+    agreement_all <- mean(
+      ensemble_df[[available_models[1]]] == ensemble_df[[available_models[2]]] &
+        ensemble_df[[available_models[2]]] == ensemble_df[[available_models[3]]]
+    )
+    cat("All models agreed on predictions: %", round(agreement_all * 100, 2), "\n")
+    
+    # Pairwise agreements
+    for (i in 1:(length(available_models)-1)) {
+      for (j in (i+1):length(available_models)) {
+        model1 <- available_models[i]
+        model2 <- available_models[j]
+        agreement <- mean(ensemble_df[[model1]] == ensemble_df[[model2]])
+        cat(sprintf("%s - %s agreement: %%%.2f\n", 
+                    model1, model2, agreement * 100))
+      }
+    }
+  }
+  
+} else if (length(available_models) == 1) {
+  cat("??? Only 1 model successful, ensemble not possible.\n")
+  cat("Best model:", available_models[1], "\n")
+} else {
+  cat("??? No models successful!\n")
+}
+
+## =========================================================
+## 13) Prediction Distribution Visualization
+## =========================================================
+cat("\nPREDICTION DISTRIBUTION VISUALIZATION...\n")
+
+if (length(predictions_list) > 0) {
+  # Combine prediction distributions
+  plot_data <- data.frame()
+  
+  for (model_name in names(predictions_list)) {
+    if (!is.null(predictions_list[[model_name]])) {
+      temp_df <- data.frame(
+        Model = model_name,
+        Status = as.character(predictions_list[[model_name]])
+      )
+      plot_data <- rbind(plot_data, temp_df)
+    }
+  }
+  
+  # Add ensemble if exists
+  if (exists("ensemble_predictions")) {
+    ensemble_df_plot <- data.frame(
+      Model = "Ensemble",
+      Status = as.character(ensemble_predictions)
+    )
+    plot_data <- rbind(plot_data, ensemble_df_plot)
+  }
+  
+  # Visualize
+  if (nrow(plot_data) > 0) {
+    p_dist <- ggplot(plot_data, aes(x = Model, fill = Status)) +
+      geom_bar(position = "fill") +
+      scale_y_continuous(labels = scales::percent) +
+      labs(
+        title = "Prediction Distribution - Model Comparison",
+        subtitle = paste("Total Predictions:", length(test_customer_ids)),
+        x = "Model",
+        y = "Percentage (%)",
+        fill = "Status"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.position = "bottom"
+      )
+    
+    print(p_dist)
+    ggsave(file.path(PROJECT_DIR, "test_prediction_distribution.png"), 
+           plot = p_dist, width = 10, height = 6)
+    
+    cat("??? Prediction distribution plot saved: test_prediction_distribution.png\n")
+  }
+}
+
+## =========================================================
+## 14) Summary Report
+## =========================================================
+cat("\n", strrep("=", 60), "\n")
+cat("TEST SUMMARY REPORT\n")
+cat(strrep("=", 60), "\n")
+
+cat("\nTEST DATA SUMMARY:\n")
+cat("Total test customers:", length(test_customer_ids), "\n")
+cat("Total features:", ncol(test_final), "\n")
+
+cat("\nPREDICTION RESULTS:\n")
+for (model_name in names(predictions_list)) {
+  if (!is.null(predictions_list[[model_name]])) {
+    cat(sprintf("??? %-20s: %d predictions\n", model_name, length(predictions_list[[model_name]])))
+    
+    # Prediction distribution
+    pred_table <- table(predictions_list[[model_name]])
+    for (status in names(pred_table)) {
+      pct <- round(100 * pred_table[status] / sum(pred_table), 1)
+      cat(sprintf("  - %s: %d (%.1f%%)\n", status, pred_table[status], pct))
+    }
+  } else {
+    cat(sprintf("??? %-20s: Failed\n", model_name))
+  }
+}
+
+if (exists("ensemble_predictions")) {
+  cat("\n??? Ensemble (Voting):", length(ensemble_predictions), "predictions\n")
+  pred_table <- table(ensemble_predictions)
+  for (status in names(pred_table)) {
+    pct <- round(100 * pred_table[status] / sum(pred_table), 1)
+    cat(sprintf("  - %s: %d (%.1f%%)\n", status, pred_table[status], pct))
+  }
+}
+
+cat("\nCREATED FILES:\n")
+for (model_name in names(predictions_list)) {
+  if (!is.null(predictions_list[[model_name]])) {
+    cat(sprintf("- submission_%s.csv\n", model_name))
+  }
+}
+if (exists("ensemble_predictions")) {
+  cat("- submission_ensemble.csv\n")
+}
+cat("- test_prediction_distribution.png\n")
+
+cat("\n", strrep("=", 60), "\n")
+cat("??? TEST PHASE SUCCESSFULLY COMPLETED!\n")
+cat(strrep("=", 60), "\n")
+
+cat("\n??? Completion Time:", Sys.time(), "\n")
+cat("??? Project Directory:", PROJECT_DIR, "\n")
+cat("??? Submission files are ready!\n")
+
+## =========================================================
+## 15) Model Comparison and Visual Analytics
+## =========================================================
+cat("\n", strrep("=", 60), "\n")
+cat("STARTING CROSS-MODEL ANALYSIS...\n")
+cat(strrep("=", 60), "\n")
+
+if (length(available_models) >= 2 && exists("ensemble_df")) {
+  
+  # 15.1 Model Agreement Rate Table
+  cat("\nMODEL PREDICTION AGREEMENT RATES:\n")
+  
+  agreement_results <- data.frame()
+  
+  for (i in 1:(length(available_models)-1)) {
+    for (j in (i+1):length(available_models)) {
+      m1 <- available_models[i]
+      m2 <- available_models[j]
+      
+      agree_count <- sum(ensemble_df[[m1]] == ensemble_df[[m2]])
+      agree_pct <- (agree_count / nrow(ensemble_df)) * 100
+      
+      agreement_results <- rbind(agreement_results, data.frame(
+        Model_A = m1,
+        Model_B = m2,
+        Matching_Records = agree_count,
+        Agreement_Percentage = round(agree_pct, 2)
+      ))
+    }
+  }
+  print(agreement_results)
+  
+  # 15.2 Side-by-Side Distribution Comparison
+  plot_compare <- plot_data %>%
+    group_by(Model, Status) %>%
+    summarise(Count = n(), .groups = "drop") %>%
+    group_by(Model) %>%
+    mutate(Percentage = Count / sum(Count) * 100)
+  
+  p_compare <- ggplot(plot_compare, aes(x = Status, y = Percentage, fill = Model)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+    geom_text(aes(label = sprintf("%.1f%%", Percentage)), 
+              position = position_dodge(width = 0.8), vjust = -0.5, size = 3.5) +
+    scale_fill_manual(values = c("#3498db", "#e74c3c", "#2ecc71", "#9b59b6")) +
+    labs(
+      title = "Prediction Distribution: Model Comparison",
+      subtitle = paste("Analysis of", length(test_customer_ids), "Test Samples"),
+      x = "Predicted Customer Status",
+      y = "Percentage of Total (%)",
+      fill = "Algorithm"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "top",
+      plot.title = element_text(face = "bold", size = 14),
+      axis.text = element_text(size = 11)
+    )
+  
+  print(p_compare)
+  ggsave(file.path(PROJECT_DIR, "model_status_comparison.png"), p_compare, width = 10, height = 6)
+  
+  # 15.3 Decision Confidence Analysis
+  if (length(available_models) == 3) {
+    ensemble_df$Confidence <- apply(ensemble_df[, available_models], 1, function(x) {
+      unique_votes <- length(unique(x))
+      if (unique_votes == 1) return("High (3/3 Agreement)")
+      if (unique_votes == 2) return("Medium (2/3 Majority)")
+      return("Low (Split Decision)")
+    })
+    
+    p_conf <- ggplot(ensemble_df, aes(x = Confidence, fill = Confidence)) +
+      geom_bar() +
+      scale_fill_manual(values = c("High (3/3 Agreement)" = "#27ae60", 
+                                   "Medium (2/3 Majority)" = "#f1c40f", 
+                                   "Low (Split Decision)" = "#e67e22")) +
+      labs(
+        title = "Ensemble Prediction Confidence",
+        subtitle = "How many models agreed on the same prediction per customer?",
+        x = "Consensus Level",
+        y = "Customer Count"
+      ) +
+      theme_light() +
+      theme(plot.title = element_text(face = "bold")) +
+      guides(fill = "none")
+    
+    print(p_conf)
+    ggsave(file.path(PROJECT_DIR, "ensemble_confidence.png"), p_conf, width = 8, height = 5)
+  }
+}
+
+## =========================================================
+## 16) Final Prediction Summary (Tidy Table)
+## =========================================================
+cat("\nFINAL PREDICTION SUMMARY TABLE:\n")
+summary_stats <- plot_data %>%
+  group_by(Model, Status) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = Status, values_from = n, values_fill = 0)
+
+print(as.data.frame(summary_stats))
+
+cat("\n??? Visual analysis and summary reports are ready in PROJECT_DIR.\n")
+

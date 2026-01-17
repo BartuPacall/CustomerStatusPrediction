@@ -1,0 +1,16 @@
+"Variable1","Variable2","Correlation"
+"has_survey","no_response_flag",-1
+"has_survey","has_bug_report",1
+"no_response_flag","has_bug_report",-1
+"Survey_count","Total_Bug_Count",0.985098803072495
+"Total.Revenue","Revenue_per_Month",0.931133380373778
+"has_survey","response_delay_days",0.928462008698096
+"no_response_flag","response_delay_days",-0.928462008698096
+"response_delay_days","has_bug_report",0.928462008698096
+"NPS_mean","Satisfaction_Composite",0.919460744508328
+"Help.Ticket.Count","Support_Burden",0.903472376841133
+"Value_mean","Satisfaction_Composite",0.891721807887731
+"Quality_mean","Satisfaction_Composite",0.83336823484603
+"Survey_count","has_survey",0.822326570549625
+"Survey_count","no_response_flag",-0.822326570549625
+"Survey_count","has_bug_report",0.822326570549625

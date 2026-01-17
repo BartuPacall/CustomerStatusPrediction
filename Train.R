@@ -1,0 +1,1663 @@
+## =========================================================
+## 0) Setup
+## =========================================================
+rm(list = ls())
+set.seed(42)
+
+PROJECT_DIR <- "C:/Users/Bartu/Desktop/Customer_Status_Prediction"
+DATA_DIR <- file.path(PROJECT_DIR, "Train Datasets")
+
+library(dplyr)
+library(tidyr)
+library(caret)
+library(corrplot)
+library(ggplot2)
+library(randomForest)
+library(nnet)
+library(gbm)
+library(psych)
+library(scales)
+library(pROC)
+library(tidytext)
+
+cat("=========================================================\n")
+cat("CUSTOMER STATUS PREDICTION - TRAIN PHASE\n")
+cat("=========================================================\n")
+
+## =========================================================
+## 1) Read Data
+## =========================================================
+cat("\nReading data files...\n")
+
+read_data_file <- function(file_name) {
+  read.csv(file.path(DATA_DIR, file_name), stringsAsFactors = FALSE)
+}
+
+data_files <- list(
+  status = "customer_status_level_train.csv",
+  demographics = "customer_demographics_train.csv",
+  revenue = "customer_monthly_recurring_revenue_train.csv",
+  region = "customer_region_and_industry_train.csv",
+  history = "customer_revenue_history_train.csv",
+  satisfaction = "customer_satisfaction_scores_train.csv",
+  engagement = "newsletter_engagement_train.csv",
+  bug = "product_bug_reports_train.csv",
+  ticket = "support_ticket_activity_train.csv"
+)
+
+# Read all files
+data_list <- lapply(data_files, read_data_file)
+names(data_list) <- c(
+  "Customer_Status", "Customer_Demographics", "Customer_Revenue",
+  "Customer_Region_Industry", "Customer_Revenue_History",
+  "Customer_Satisfaction", "Customer_Engagement",
+  "Customer_Bug_Reports", "Customer_Ticket_Activity"
+)
+
+# Assign to global environment
+list2env(data_list, envir = .GlobalEnv)
+cat("Data files loaded.\n")
+
+## =========================================================
+## 2) Standardize ID Column Names
+## =========================================================
+Customer_Demographics <- Customer_Demographics %>% rename(Customer.ID = CUS.ID)
+
+## =========================================================
+## 3) Duplicate Record Check
+## =========================================================
+cat("\nDuplicate record check...\n")
+
+## 3.1) Data Set Preliminary Examination (Data Audit)
+cat("\nStarting data set preliminary examination...\n")
+
+# Create general summary table
+data_summary <- data.frame(
+  Dataset = names(data_list),
+  Rows = sapply(data_list, nrow),
+  Cols = sapply(data_list, ncol),
+  Total_NA = sapply(data_list, function(x) sum(is.na(x))),
+  Unique_Customers = sapply(data_list, function(x) {
+    id_col <- grep("ID", names(x), value = TRUE, ignore.case = TRUE)[1]
+    if(!is.na(id_col)) length(unique(x[[id_col]])) else NA
+  })
+)
+
+print(data_summary)
+
+cat("\nDetailed column and type analysis:\n")
+
+# Function for column-level NA and type check
+check_details <- function(df_name, df) {
+  cat(paste0("\n--- Table: ", df_name, " ---\n"))
+  
+  details <- data.frame(
+    Column = names(df),
+    Type = sapply(df, class),
+    NA_Count = sapply(df, function(x) sum(is.na(x))),
+    NA_Perc = sapply(df, function(x) round(mean(is.na(x)) * 100, 2)),
+    Unique_Values = sapply(df, function(x) length(unique(x)))
+  )
+  
+  print(details)
+}
+
+# Apply function to all tables
+invisible(lapply(names(data_list), function(n) check_details(n, data_list[[n]])))
+
+cat("\nTarget variable distribution:\n")
+status_dist <- table(Customer_Status$Status)
+print(status_dist)
+print(prop.table(status_dist)) # Percentage distribution
+
+## 3.2) In-depth Data Analysis (Deep EDA)
+# A. Target Variable Analysis
+ggplot(Customer_Status, aes(x = Status, fill = Status)) +
+  geom_bar() +
+  theme_minimal() +
+  labs(title = "Customer Status Distribution", x = "Status", y = "Count")
+
+# Check for duplicate Customer.IDs
+dup_counts <- sapply(data_list, function(x) {
+  id_col <- grep("ID", names(x), value = TRUE, ignore.case = TRUE)[1]
+  if(!is.na(id_col)) sum(duplicated(x[[id_col]])) else 0
+})
+
+dup_summary <- data.frame(
+  Dataset = names(dup_counts),
+  Duplicate_IDs = as.numeric(dup_counts)
+)
+
+cat("\nDuplicate ID counts:\n")
+print(dup_summary)
+
+## =========================================================
+## 4) Aggregation - Customer-based Summarization
+## =========================================================
+cat("\nData aggregation operations...\n")
+
+## 4.1 Helper function for mode
+get_mode_chr <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_character_)
+  tb <- sort(table(x), decreasing = TRUE)
+  names(tb)[1]
+}
+
+## 4.2 Bug Reports -> total count
+Customer_Bug_Reports_Agg <- Customer_Bug_Reports %>%
+  group_by(Customer.ID) %>%
+  summarise(
+    Total_Bug_Count = sum(Product.Bug.Task.Count, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+## 4.3 Process Satisfaction surveys
+names(Customer_Satisfaction) <- c(
+  "Customer.ID", "Year", "Quarter", "Survey_Date", "Response_Date",
+  "NPS", "Value_Score", "Usage_Freq", "Quality_Score",
+  "Usability_Score", "Reporting_Score"
+)
+
+Customer_Satisfaction <- Customer_Satisfaction %>%
+  mutate(
+    Survey_Date = as.Date(Survey_Date),
+    Response_Date = as.Date(Response_Date)
+  )
+
+# Get last survey records
+last_rows <- Customer_Satisfaction %>%
+  mutate(last_date = coalesce(Survey_Date, Response_Date)) %>%
+  arrange(Customer.ID, last_date) %>%
+  group_by(Customer.ID) %>%
+  slice_tail(n = 1) %>%
+  ungroup() %>%
+  select(Customer.ID, Year, Quarter, Survey_Date, Response_Date)
+
+# Aggregate satisfaction data
+Customer_Satisfaction_Agg <- Customer_Satisfaction %>%
+  group_by(Customer.ID) %>%
+  summarise(
+    NPS_mean = mean(NPS, na.rm = TRUE),
+    Value_mean = mean(Value_Score, na.rm = TRUE),
+    Quality_mean = mean(Quality_Score, na.rm = TRUE),
+    Usability_mean = mean(Usability_Score, na.rm = TRUE),
+    Reporting_score = get_mode_chr(Reporting_Score),
+    Usage_Freq = get_mode_chr(Usage_Freq),
+    Survey_count = n(),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    last_rows %>%
+      rename(
+        Year_Last = Year,
+        Quarter_Last = Quarter,
+        Last_Survey_Date = Survey_Date,
+        Last_Response_Date = Response_Date
+      ),
+    by = "Customer.ID"
+  )
+
+## 4.4 Ticket Activity -> total tickets + average resolution time
+Customer_Ticket_Activity_Agg <- if (sum(duplicated(Customer_Ticket_Activity$Customer.ID)) > 0) {
+  Customer_Ticket_Activity %>%
+    group_by(Customer.ID) %>%
+    summarise(
+      Help.Ticket.Count = sum(Help.Ticket.Count, na.rm = TRUE),
+      Help.Ticket.Lead.Time..hours. = mean(Help.Ticket.Lead.Time..hours., na.rm = TRUE),
+      .groups = "drop"
+    )
+} else {
+  Customer_Ticket_Activity
+}
+
+## 4.5 Newsletter Engagement -> total interactions
+Customer_Engagement_Agg <- if (sum(duplicated(Customer_Engagement$Customer.ID)) > 0) {
+  Customer_Engagement %>%
+    group_by(Customer.ID) %>%
+    summarise(
+      Company.Newsletter.Interaction.Count = sum(Company.Newsletter.Interaction.Count, na.rm = TRUE),
+      .groups = "drop"
+    )
+} else {
+  Customer_Engagement
+}
+
+cat("Aggregation operations completed.\n")
+
+## =========================================================
+## 5) Merge All Data Sets (master_train)
+## =========================================================
+cat("\nData merging...\n")
+
+master_train <- Customer_Status %>%
+  left_join(Customer_Demographics, by = "Customer.ID") %>%
+  left_join(Customer_Revenue, by = "Customer.ID") %>%
+  left_join(Customer_Region_Industry, by = "Customer.ID") %>%
+  left_join(Customer_Revenue_History, by = "Customer.ID") %>%
+  left_join(Customer_Satisfaction_Agg, by = "Customer.ID") %>%
+  left_join(Customer_Engagement_Agg, by = "Customer.ID") %>%
+  left_join(Customer_Bug_Reports_Agg, by = "Customer.ID") %>%
+  left_join(Customer_Ticket_Activity_Agg, by = "Customer.ID")
+
+stopifnot(nrow(master_train) == nrow(Customer_Status))
+stopifnot(sum(duplicated(master_train$Customer.ID)) == 0)
+
+cat("Data merged. Total customers:", nrow(master_train), "\n")
+
+# Check summary statistics for numeric columns
+cat("\nNumeric variable summary:\n")
+num_cols <- master_train %>% select(where(is.numeric))
+psych::describe(num_cols)
+
+## =========================================================
+## 6) Basic Cleaning (Before Correlation Analysis)
+## =========================================================
+cat("\nBasic data cleaning...\n")
+
+## 6.1 Clean currency columns
+currency_columns <- c("MRR", "Total.Revenue")
+for (col in currency_columns) {
+  if (col %in% colnames(master_train)) {
+    master_train[[col]] <- as.numeric(gsub("[\\$,]", "", as.character(master_train[[col]])))
+  }
+}
+
+## 6.2 Factor conversions (categorical variables)
+factor_columns <- c("Status", "Region", "Customer.Level", "Vertical", "Subvertical", 
+                    "Usage_Freq", "Reporting_score")
+for (col in factor_columns) {
+  if (col %in% colnames(master_train)) {
+    master_train[[col]] <- as.factor(master_train[[col]])
+  }
+}
+
+## 6.3 Process date variables
+date_columns <- c("Last_Survey_Date", "Last_Response_Date")
+for (col in date_columns) {
+  if (col %in% colnames(master_train)) {
+    master_train[[col]] <- as.Date(master_train[[col]])
+  }
+}
+
+cat("Basic cleaning completed.\n")
+
+## =========================================================
+## 7) Correlation Analysis (Before Feature Engineering)
+## =========================================================
+cat("\n", strrep("=", 60), "\n")
+cat("CORRELATION ANALYSIS - Before Feature Engineering\n")
+cat(strrep("=", 60), "\n")
+
+## 7.1 Select numeric variables (basic variables)
+numeric_vars_raw <- master_train %>%
+  select(where(is.numeric)) %>%
+  select(-Year_Last, -Quarter_Last)  # Numeric variables that act like categorical
+
+# Remove variables with zero standard deviation (constant values)
+zero_sd_vars <- names(which(apply(numeric_vars_raw, 2, function(x) sd(x, na.rm = TRUE)) == 0))
+if (length(zero_sd_vars) > 0) {
+  cat("Removing constant value variables:", paste(zero_sd_vars, collapse = ", "), "\n")
+  numeric_vars_raw <- numeric_vars_raw %>% select(-all_of(zero_sd_vars))
+}
+
+cat("Number of numeric variables analyzed:", ncol(numeric_vars_raw), "\n")
+
+## 7.2 Calculate correlation matrix (with missing data check)
+complete_cases <- complete.cases(numeric_vars_raw)
+if (sum(complete_cases) < 10) {
+  cat("Too much missing data, using pairwise correlation\n")
+  cor_matrix_raw <- cor(numeric_vars_raw, use = "pairwise.complete.obs", method = "pearson")
+} else {
+  cor_matrix_raw <- cor(numeric_vars_raw[complete_cases, ], use = "complete.obs", method = "pearson")
+}
+
+cat("Correlation matrix dimensions:", dim(cor_matrix_raw), "\n")
+
+## 7.3 Create Heatmap (Raw correlation)
+cat("\nCreating raw correlation heatmap...\n")
+png(file.path(PROJECT_DIR, "correlation_raw_before_fe.png"), width = 1200, height = 1000)
+corrplot(cor_matrix_raw, 
+         method = "color",
+         type = "upper",
+         tl.col = "black",
+         tl.cex = 0.7,
+         number.cex = 0.6,
+         title = "RAW CORRELATION MATRIX (Before Feature Engineering)",
+         mar = c(0, 0, 2, 0))
+dev.off()
+cat("Raw correlation heatmap saved: correlation_raw_before_fe.png\n")
+
+## 7.4 Find high correlations (|r| > 0.8)
+cor_matrix_raw_no_na <- cor_matrix_raw
+cor_matrix_raw_no_na[is.na(cor_matrix_raw_no_na)] <- 0
+
+high_corr_raw <- which(abs(cor_matrix_raw_no_na) > 0.8 & 
+                         upper.tri(cor_matrix_raw_no_na) & 
+                         cor_matrix_raw_no_na != 1, arr.ind = TRUE)
+
+if (length(high_corr_raw) > 0 && nrow(high_corr_raw) > 0) {
+  cat("\nHIGHLY CORRELATED VARIABLES (|r| > 0.8):\n")
+  high_corr_df_raw <- data.frame(
+    Variable1 = rownames(cor_matrix_raw_no_na)[high_corr_raw[, 1]],
+    Variable2 = colnames(cor_matrix_raw_no_na)[high_corr_raw[, 2]],
+    Correlation = cor_matrix_raw_no_na[high_corr_raw]
+  )
+  high_corr_df_raw <- high_corr_df_raw[order(-abs(high_corr_df_raw$Correlation)), ]
+  print(high_corr_df_raw)
+  
+  # Save highly correlated variables
+  write.csv(high_corr_df_raw, file.path(PROJECT_DIR, "high_correlation_raw.csv"), row.names = FALSE)
+  cat("\nRaw correlation analysis saved: high_correlation_raw.csv\n")
+  
+  ## 7.5 Visualization for high correlation analysis
+  cat("\nHIGH CORRELATION ANALYSIS:\n")
+  
+  # Visualize top 3 correlation pairs
+  top_pairs <- head(high_corr_df_raw, 3)
+  
+  for (i in 1:min(3, nrow(top_pairs))) {
+    var1 <- top_pairs$Variable1[i]
+    var2 <- top_pairs$Variable2[i]
+    corr <- top_pairs$Correlation[i]
+    
+    # Use only non-missing data
+    plot_data <- master_train[complete.cases(master_train[, c(var1, var2)]), c(var1, var2)]
+    
+    if (nrow(plot_data) > 10) {
+      p <- ggplot(plot_data, aes_string(x = var1, y = var2)) +
+        geom_point(alpha = 0.5, color = "steelblue", size = 2) +
+        geom_smooth(method = "lm", color = "red", se = FALSE) +
+        labs(
+          title = paste("High Correlation: ", round(corr, 3)),
+          subtitle = paste(var1, "vs", var2),
+          x = var1,
+          y = var2
+        ) +
+        theme_minimal() +
+        theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+              plot.subtitle = element_text(hjust = 0.5))
+      
+      print(p)
+      
+      # Save graph (simple filename to avoid Turkish character issues)
+      filename <- paste0("high_corr_", gsub("[^A-Za-z0-9]", "_", var1), 
+                         "_vs_", gsub("[^A-Za-z0-9]", "_", var2), ".png")
+      ggsave(file.path(PROJECT_DIR, filename), 
+             plot = p, width = 8, height = 6)
+    }
+  }
+  cat("High correlation scatter plots saved\n")
+} else {
+  cat("\nNo highly correlated variables in raw data (|r| > 0.8)\n")
+}
+
+## 7.6 Correlation analysis with Status
+cat("\nCORRELATION ANALYSIS WITH STATUS:\n")
+
+# Convert Status to numeric (for analysis)
+status_numeric <- as.numeric(master_train$Status)
+
+# Calculate correlation with Status for each numeric variable (with error control)
+status_correlations_raw <- data.frame(
+  Variable = colnames(numeric_vars_raw),
+  Correlation_with_Status = NA_real_,
+  Abs_Correlation = NA_real_
+)
+
+for (i in 1:ncol(numeric_vars_raw)) {
+  var_name <- colnames(numeric_vars_raw)[i]
+  var_data <- numeric_vars_raw[[i]]
+  
+  # Remove missing values
+  valid_indices <- complete.cases(data.frame(var_data, status_numeric))
+  
+  if (sum(valid_indices) > 10 && sd(var_data[valid_indices], na.rm = TRUE) > 0) {
+    cor_result <- cor(var_data[valid_indices], status_numeric[valid_indices], 
+                      use = "complete.obs")
+    status_correlations_raw$Correlation_with_Status[i] <- cor_result
+    status_correlations_raw$Abs_Correlation[i] <- abs(cor_result)
+  }
+}
+
+# Remove NA values and sort
+status_correlations_raw <- status_correlations_raw %>%
+  filter(!is.na(Correlation_with_Status)) %>%
+  arrange(-Abs_Correlation)
+
+cat("\nVARIABLES WITH HIGHEST CORRELATION WITH STATUS:\n")
+print(head(status_correlations_raw, 10))
+
+# Status correlation graph (show all if less than 15)
+n_vars_to_plot <- min(15, nrow(status_correlations_raw))
+if (n_vars_to_plot > 0) {
+  plot_data <- head(status_correlations_raw, n_vars_to_plot)
+  
+  p_status <- ggplot(plot_data, 
+                     aes(x = reorder(Variable, Abs_Correlation), y = Correlation_with_Status)) +
+    geom_bar(stat = "identity", 
+             fill = ifelse(plot_data$Correlation_with_Status > 0, "steelblue", "coral"), 
+             alpha = 0.8) +
+    geom_text(aes(label = sprintf("%.3f", Correlation_with_Status)), 
+              hjust = ifelse(plot_data$Correlation_with_Status > 0, -0.1, 1.1),
+              size = 3) +
+    coord_flip() +
+    labs(
+      title = "Correlation with Status",
+      x = "Variable",
+      y = "Correlation Coefficient"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  print(p_status)
+  ggsave(file.path(PROJECT_DIR, "status_correlation.png"), 
+         plot = p_status, width = 10, height = 8)
+}
+
+## =========================================================
+## 8) Feature Engineering (Based on Correlation Analysis)
+## =========================================================
+cat("\n", strrep("=", 60), "\n")
+cat("FEATURE ENGINEERING - Based on Correlation Analysis\n")
+cat(strrep("=", 60), "\n")
+
+cat("\nCORRELATION ANALYSIS FINDINGS:\n")
+if (exists("high_corr_df_raw") && nrow(high_corr_df_raw) > 0) {
+  cat("1. Highly correlated variable pairs:", nrow(high_corr_df_raw), "pairs\n")
+  cat("   Example:", paste(head(high_corr_df_raw$Variable1, 2), 
+                           head(high_corr_df_raw$Variable2, 2), sep = " vs ", collapse = ", "), "\n")
+} else {
+  cat("1. No highly correlated variable pairs\n")
+}
+cat("2. Variables most related to Status identified\n")
+cat("3. Feature engineering will be done based on these findings\n")
+
+## 8.1 Missing value handling (Flags + imputation)
+cat("\nMISSING VALUE PROCESSING...\n")
+
+# MRR and Total Revenue flags + imputation
+master_train$MRR_na_flag <- as.integer(is.na(master_train$MRR))
+master_train$MRR[is.na(master_train$MRR)] <- 0
+
+master_train$Total.Revenue_na_flag <- as.integer(is.na(master_train$Total.Revenue))
+master_train$Total.Revenue[is.na(master_train$Total.Revenue)] <- 0
+
+# Imputation for variables found important in correlation analysis
+if ("Customer.Age..Months." %in% colnames(master_train)) {
+  master_train$Customer.Age..Months.[is.na(master_train$Customer.Age..Months.)] <- 
+    median(master_train$Customer.Age..Months., na.rm = TRUE)
+}
+
+## 8.2 Survey scores missing -> only flag
+master_train$has_survey <- ifelse(is.na(master_train$NPS_mean), 0, 1)
+
+# Median imputation for survey scores with high correlation to Status
+survey_vars <- c("NPS_mean", "Value_mean", "Quality_mean", "Usability_mean")
+for (var in survey_vars) {
+  if (var %in% colnames(master_train)) {
+    master_train[[var]][is.na(master_train[[var]])] <- median(master_train[[var]], na.rm = TRUE)
+  }
+}
+
+## 8.3 Categorical NA -> "None"
+master_train <- master_train %>%
+  mutate(
+    Reporting_score = replace_na(as.character(Reporting_score), "None"),
+    Usage_Freq = replace_na(as.character(Usage_Freq), "None")
+  )
+
+## 8.4 Survey_count NA -> 0
+master_train$Survey_count[is.na(master_train$Survey_count)] <- 0
+
+## 8.5 Response delay feature (NEW)
+master_train$no_response_flag <- ifelse(
+  is.na(master_train$Last_Response_Date) | is.na(master_train$Last_Survey_Date), 1, 0
+)
+
+master_train$response_delay_days <- as.numeric(master_train$Last_Response_Date - master_train$Last_Survey_Date)
+master_train$response_delay_days[is.na(master_train$response_delay_days)] <- 0
+master_train$response_delay_days[master_train$response_delay_days < 0] <- 0
+
+## 8.6 Newsletter / bug / ticket flags
+master_train$has_newsletter_interaction <- ifelse(is.na(master_train$Company.Newsletter.Interaction.Count), 0, 1)
+master_train$Company.Newsletter.Interaction.Count[is.na(master_train$Company.Newsletter.Interaction.Count)] <- 0
+
+master_train$has_bug_report <- ifelse(is.na(master_train$Total_Bug_Count), 0, 1)
+master_train$Total_Bug_Count[is.na(master_train$Total_Bug_Count)] <- 0
+
+master_train$has_ticket <- ifelse(is.na(master_train$Help.Ticket.Count), 0, 1)
+master_train$Help.Ticket.Count[is.na(master_train$Help.Ticket.Count)] <- 0
+
+master_train$Help.Ticket.Lead.Time..hours.[is.na(master_train$Help.Ticket.Lead.Time..hours.)] <- 0
+
+## 8.7 NEW FEATURES - Based on correlation analysis
+cat("\nCreating new features...\n")
+
+# 1) Satisfaction Composite Score (from variables with high correlation to Status)
+master_train$Satisfaction_Composite <- rowMeans(
+  master_train[, c("NPS_mean", "Value_mean", "Quality_mean", "Usability_mean")],
+  na.rm = TRUE
+)
+
+# 2) Support Burden (Ticket count and duration)
+master_train$Support_Burden <- master_train$Help.Ticket.Count * 
+  ifelse(master_train$Help.Ticket.Lead.Time..hours. > 0, 
+         master_train$Help.Ticket.Lead.Time..hours., 1)
+
+# 3) Revenue Efficiency (Total Revenue / Customer Age)
+master_train$Revenue_per_Month <- ifelse(
+  master_train$Customer.Age..Months. > 0,
+  master_train$Total.Revenue / master_train$Customer.Age..Months.,
+  0
+)
+
+# 4) Bug Frequency (Bug count / Customer Age)
+master_train$Bug_Frequency <- ifelse(
+  master_train$Customer.Age..Months. > 0,
+  master_train$Total_Bug_Count / master_train$Customer.Age..Months.,
+  0
+)
+
+# 5) Engagement Ratio (Newsletter interaction / Customer Age)
+master_train$Engagement_Ratio <- ifelse(
+  master_train$Customer.Age..Months. > 0,
+  master_train$Company.Newsletter.Interaction.Count / master_train$Customer.Age..Months.,
+  0
+)
+
+# 6) MRR to Total Revenue Ratio
+master_train$MRR_Ratio <- ifelse(
+  master_train$Total.Revenue > 0,
+  master_train$MRR / master_train$Total.Revenue,
+  0
+)
+
+cat("6 new features created.\n")
+
+## =========================================================
+## 9) Post-Correlation Analysis Check
+## =========================================================
+cat("\n", strrep("=", 60), "\n")
+cat("CORRELATION ANALYSIS - After Feature Engineering\n")
+cat(strrep("=", 60), "\n")
+
+## 9.1 Select new numeric variables
+numeric_vars_final <- master_train %>%
+  select(where(is.numeric)) %>%
+  select(-Year_Last, -Quarter_Last)
+
+# Remove constant value variables
+zero_sd_vars_final <- names(which(apply(numeric_vars_final, 2, function(x) sd(x, na.rm = TRUE)) == 0))
+if (length(zero_sd_vars_final) > 0) {
+  cat("Removing constant value variables:", paste(zero_sd_vars_final, collapse = ", "), "\n")
+  numeric_vars_final <- numeric_vars_final %>% select(-all_of(zero_sd_vars_final))
+}
+
+cat("Number of numeric variables after feature engineering:", ncol(numeric_vars_final), "\n")
+
+## 9.2 Final correlation matrix
+complete_cases_final <- complete.cases(numeric_vars_final)
+if (sum(complete_cases_final) < 10) {
+  cor_matrix_final <- cor(numeric_vars_final, use = "pairwise.complete.obs", method = "pearson")
+} else {
+  cor_matrix_final <- cor(numeric_vars_final[complete_cases_final, ], use = "complete.obs", method = "pearson")
+}
+
+## 9.3 Create Heatmap (Final state)
+png(file.path(PROJECT_DIR, "correlation_final_after_fe.png"), width = 1200, height = 1000)
+corrplot(cor_matrix_final, 
+         method = "color",
+         type = "upper",
+         tl.col = "black",
+         tl.cex = 0.6,
+         number.cex = 0.5,
+         title = "FINAL CORRELATION MATRIX (After Feature Engineering)",
+         mar = c(0, 0, 2, 0))
+dev.off()
+cat("Final correlation heatmap saved: correlation_final_after_fe.png\n")
+
+## 9.4 High correlation check (after feature engineering)
+cor_matrix_final_no_na <- cor_matrix_final
+cor_matrix_final_no_na[is.na(cor_matrix_final_no_na)] <- 0
+
+high_corr_final <- which(abs(cor_matrix_final_no_na) > 0.8 & 
+                           upper.tri(cor_matrix_final_no_na) & 
+                           cor_matrix_final_no_na != 1, arr.ind = TRUE)
+
+if (length(high_corr_final) > 0 && nrow(high_corr_final) > 0) {
+  cat("\nHIGHLY CORRELATED VARIABLES AFTER FEATURE ENGINEERING (|r| > 0.8):\n")
+  high_corr_df_final <- data.frame(
+    Variable1 = rownames(cor_matrix_final_no_na)[high_corr_final[, 1]],
+    Variable2 = colnames(cor_matrix_final_no_na)[high_corr_final[, 2]],
+    Correlation = cor_matrix_final_no_na[high_corr_final]
+  )
+  high_corr_df_final <- high_corr_df_final[order(-abs(high_corr_df_final$Correlation)), ]
+  print(high_corr_df_final)
+  
+  write.csv(high_corr_df_final, file.path(PROJECT_DIR, "high_correlation_final.csv"), row.names = FALSE)
+  cat("\nFinal correlation analysis saved: high_correlation_final.csv\n")
+} else {
+  cat("\nNo highly correlated variables after feature engineering (|r| > 0.8)\n")
+}
+
+## 9.5 Correlation with Status (after feature engineering)
+status_correlations_final <- data.frame(
+  Variable = colnames(numeric_vars_final),
+  Correlation_with_Status = NA_real_,
+  Abs_Correlation = NA_real_
+)
+
+for (i in 1:ncol(numeric_vars_final)) {
+  var_name <- colnames(numeric_vars_final)[i]
+  var_data <- numeric_vars_final[[i]]
+  
+  valid_indices <- complete.cases(data.frame(var_data, status_numeric))
+  
+  if (sum(valid_indices) > 10 && sd(var_data[valid_indices], na.rm = TRUE) > 0) {
+    cor_result <- cor(var_data[valid_indices], status_numeric[valid_indices], 
+                      use = "complete.obs")
+    status_correlations_final$Correlation_with_Status[i] <- cor_result
+    status_correlations_final$Abs_Correlation[i] <- abs(cor_result)
+  }
+}
+
+status_correlations_final <- status_correlations_final %>%
+  filter(!is.na(Correlation_with_Status)) %>%
+  arrange(-Abs_Correlation)
+
+cat("\nNEW VARIABLES WITH HIGHEST CORRELATION WITH STATUS:\n")
+print(head(status_correlations_final, 10))
+
+# New features correlation with Status graph
+new_features <- c("Satisfaction_Composite", "Support_Burden", "Revenue_per_Month", 
+                  "Bug_Frequency", "Engagement_Ratio", "MRR_Ratio")
+new_features_data <- status_correlations_final %>%
+  filter(Variable %in% new_features)
+
+if (nrow(new_features_data) > 0) {
+  p_new_features <- ggplot(new_features_data, 
+                           aes(x = reorder(Variable, Abs_Correlation), y = Correlation_with_Status)) +
+    geom_bar(stat = "identity", fill = "lightgreen", alpha = 0.8) +
+    geom_text(aes(label = sprintf("%.3f", Correlation_with_Status)), 
+              hjust = ifelse(new_features_data$Correlation_with_Status > 0, -0.1, 1.1),
+              size = 3.5) +
+    coord_flip() +
+    labs(
+      title = "New Features Correlation with Status",
+      x = "New Feature",
+      y = "Correlation Coefficient"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  print(p_new_features)
+  ggsave(file.path(PROJECT_DIR, "new_features_correlation.png"), 
+         plot = p_new_features, width = 10, height = 6)
+}
+
+## =========================================================
+## 10) Variable Selection and Model Preparation
+## =========================================================
+cat("\n", strrep("=", 60), "\n")
+cat("VARIABLE SELECTION AND MODEL PREPARATION\n")
+cat(strrep("=", 60), "\n")
+
+cat("\nVARIABLE SELECTION CRITERIA:\n")
+cat("1. Variables with highest correlation with Status\n")
+cat("2. Remove one from highly correlated pairs\n")
+cat("3. Include newly created features\n")
+
+# Select variables for model
+# Remove ID and date variables
+master_model <- master_train %>%
+  select(-Customer.ID, -Last_Survey_Date, -Last_Response_Date)
+
+# Remove original variables to prevent MULTICOLLINEARITY
+# Remove original variables after creating new features
+variables_to_remove <- c(
+  "NPS_mean", "Value_mean", "Quality_mean", "Usability_mean",
+  "Help.Ticket.Count", "Help.Ticket.Lead.Time..hours."
+)
+
+cat("\nREMOVING VARIABLES TO PREVENT MULTICOLLINEARITY:\n")
+for (var in variables_to_remove) {
+  if (var %in% colnames(master_model)) {
+    cat("  -", var, "removed\n")
+  }
+}
+
+master_model <- master_model %>%
+  select(-any_of(variables_to_remove))
+
+# Convert categorical variables to factor again
+cat_cols <- c("Region", "Customer.Level", "Vertical", "Subvertical", "Usage_Freq", "Reporting_score")
+for (col in cat_cols) {
+  if (col %in% colnames(master_model)) {
+    master_model[[col]] <- as.factor(as.character(master_model[[col]]))
+  }
+}
+
+# IMPORTANT: Check and fix NA values
+cat("\nCHECKING NA VALUES IN FINAL MODEL DATA SET...\n")
+na_summary <- sapply(master_model, function(x) sum(is.na(x)))
+na_vars <- names(na_summary[na_summary > 0])
+
+if (length(na_vars) > 0) {
+  cat("Variables containing NA:", length(na_vars), "\n")
+  cat("   Total NA count:", sum(na_summary), "\n")
+  
+  # Fill numeric variables with median
+  numeric_vars <- sapply(master_model, is.numeric)
+  for (var in na_vars) {
+    if (numeric_vars[var]) {
+      master_model[[var]][is.na(master_model[[var]])] <- median(master_model[[var]], na.rm = TRUE)
+      cat("   -", var, ": NA values filled with median (", na_summary[var], " NA)\n", sep = "")
+    } else if (is.factor(master_model[[var]])) {
+      # Fill factor variables with mode
+      mode_val <- names(sort(table(master_model[[var]]), decreasing = TRUE))[1]
+      master_model[[var]][is.na(master_model[[var]])] <- mode_val
+      cat("   -", var, ": NA values filled with mode(", mode_val, ") (", na_summary[var], " NA)\n", sep = "")
+    }
+  }
+}
+
+cat("\nFINAL MODEL DATA SET:\n")
+cat("Number of rows:", nrow(master_model), "\n")
+cat("Number of columns:", ncol(master_model), "\n")
+cat("NA count (after correction):", sum(is.na(master_model)), "\n")
+
+# Check Status distribution
+cat("Status distribution:\n")
+print(table(master_model$Status))
+
+## =========================================================
+## 11) Post-Cleaning Correlation Analysis (2nd Analysis)
+## =========================================================
+cat("\n", strrep("=", 60), "\n")
+cat("POST-CLEANING CORRELATION ANALYSIS (2nd Analysis)\n")
+cat(strrep("=", 60), "\n")
+
+## 11.1 Select numeric variables after cleaning
+numeric_vars_clean <- master_model %>%
+  select(where(is.numeric))
+
+# Remove constant value variables
+zero_sd_vars_clean <- names(which(apply(numeric_vars_clean, 2, function(x) sd(x, na.rm = TRUE)) == 0))
+if (length(zero_sd_vars_clean) > 0) {
+  cat("Removing constant value variables:", paste(zero_sd_vars_clean, collapse = ", "), "\n")
+  numeric_vars_clean <- numeric_vars_clean %>% select(-all_of(zero_sd_vars_clean))
+}
+
+cat("Number of numeric variables after cleaning:", ncol(numeric_vars_clean), "\n")
+cat("Variables:", paste(colnames(numeric_vars_clean), collapse = ", "), "\n")
+
+## 11.2 Post-cleaning correlation matrix
+complete_cases_clean <- complete.cases(numeric_vars_clean)
+if (sum(complete_cases_clean) < 10) {
+  cor_matrix_clean <- cor(numeric_vars_clean, use = "pairwise.complete.obs", method = "pearson")
+} else {
+  cor_matrix_clean <- cor(numeric_vars_clean[complete_cases_clean, ], use = "complete.obs", method = "pearson")
+}
+
+cat("Post-cleaning correlation matrix dimensions:", dim(cor_matrix_clean), "\n")
+
+## 11.3 Create post-cleaning heatmap
+cat("\nCreating post-cleaning correlation heatmap...\n")
+png(file.path(PROJECT_DIR, "correlation_clean_after_removal.png"), width = 1200, height = 1000)
+corrplot(cor_matrix_clean, 
+         method = "color",
+         type = "upper",
+         tl.col = "black",
+         tl.cex = 0.6,
+         number.cex = 0.5,
+         title = "POST-CLEANING CORRELATION MATRIX (After Multicollinearity Prevention)",
+         mar = c(0, 0, 2, 0))
+dev.off()
+cat("Post-cleaning correlation heatmap saved: correlation_clean_after_removal.png\n")
+
+## 11.4 Post-cleaning high correlation check
+cor_matrix_clean_no_na <- cor_matrix_clean
+cor_matrix_clean_no_na[is.na(cor_matrix_clean_no_na)] <- 0
+
+high_corr_clean <- which(abs(cor_matrix_clean_no_na) > 0.8 & 
+                           upper.tri(cor_matrix_clean_no_na) & 
+                           cor_matrix_clean_no_na != 1, arr.ind = TRUE)
+
+if (length(high_corr_clean) > 0 && nrow(high_corr_clean) > 0) {
+  cat("\nHIGHLY CORRELATED VARIABLES AFTER CLEANING (|r| > 0.8):\n")
+  high_corr_df_clean <- data.frame(
+    Variable1 = rownames(cor_matrix_clean_no_na)[high_corr_clean[, 1]],
+    Variable2 = colnames(cor_matrix_clean_no_na)[high_corr_clean[, 2]],
+    Correlation = cor_matrix_clean_no_na[high_corr_clean]
+  )
+  high_corr_df_clean <- high_corr_df_clean[order(-abs(high_corr_df_clean$Correlation)), ]
+  print(high_corr_df_clean)
+  
+  write.csv(high_corr_df_clean, file.path(PROJECT_DIR, "high_correlation_clean.csv"), row.names = FALSE)
+  cat("\nPost-cleaning correlation analysis saved: high_correlation_clean.csv\n")
+} else {
+  cat("\nNo highly correlated variables after cleaning (|r| > 0.8)\n")
+}
+
+## 11.5 Post-cleaning Correlation with Status analysis
+status_correlations_clean <- data.frame(
+  Variable = colnames(numeric_vars_clean),
+  Correlation_with_Status = NA_real_,
+  Abs_Correlation = NA_real_
+)
+
+for (i in 1:ncol(numeric_vars_clean)) {
+  var_name <- colnames(numeric_vars_clean)[i]
+  var_data <- numeric_vars_clean[[i]]
+  
+  valid_indices <- complete.cases(data.frame(var_data, status_numeric))
+  
+  if (sum(valid_indices) > 10 && sd(var_data[valid_indices], na.rm = TRUE) > 0) {
+    cor_result <- cor(var_data[valid_indices], status_numeric[valid_indices], 
+                      use = "complete.obs")
+    status_correlations_clean$Correlation_with_Status[i] <- cor_result
+    status_correlations_clean$Abs_Correlation[i] <- abs(cor_result)
+  }
+}
+
+status_correlations_clean <- status_correlations_clean %>%
+  filter(!is.na(Correlation_with_Status)) %>%
+  arrange(-Abs_Correlation)
+
+cat("\nVARIABLES WITH HIGHEST CORRELATION WITH STATUS AFTER CLEANING:\n")
+print(head(status_correlations_clean, 10))
+
+# Post-cleaning Status correlation graph
+n_vars_to_plot_clean <- min(15, nrow(status_correlations_clean))
+if (n_vars_to_plot_clean > 0) {
+  plot_data_clean <- head(status_correlations_clean, n_vars_to_plot_clean)
+  
+  p_status_clean <- ggplot(plot_data_clean, 
+                           aes(x = reorder(Variable, Abs_Correlation), y = Correlation_with_Status)) +
+    geom_bar(stat = "identity", 
+             fill = ifelse(plot_data_clean$Correlation_with_Status > 0, "steelblue", "coral"), 
+             alpha = 0.8) +
+    geom_text(aes(label = sprintf("%.3f", Correlation_with_Status)), 
+              hjust = ifelse(plot_data_clean$Correlation_with_Status > 0, -0.1, 1.1),
+              size = 3) +
+    coord_flip() +
+    labs(
+      title = "Status Correlation After Cleaning",
+      subtitle = "After Multicollinearity Prevention",
+      x = "Variable",
+      y = "Correlation Coefficient"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5))
+  
+  print(p_status_clean)
+  ggsave(file.path(PROJECT_DIR, "status_correlation_clean.png"), 
+         plot = p_status_clean, width = 10, height = 8)
+}
+
+## 11.6 Correlation analysis comparison
+cat("\nCORRELATION ANALYSIS COMPARISON:\n")
+cat("1. Before Feature Engineering: ", ncol(numeric_vars_raw), " variables\n")
+cat("2. After Feature Engineering: ", ncol(numeric_vars_final), " variables\n")
+cat("3. After Cleaning: ", ncol(numeric_vars_clean), " variables\n")
+
+if (exists("high_corr_df_raw") && exists("high_corr_df_clean")) {
+  cat("\nHIGH CORRELATION REDUCTION SUCCESS:\n")
+  cat("   Initial high correlation pairs: ", nrow(high_corr_df_raw), "\n")
+  cat("   Post-cleaning high correlation pairs: ", nrow(high_corr_df_clean), "\n")
+  
+  if (nrow(high_corr_df_raw) > 0 && nrow(high_corr_df_clean) > 0) {
+    reduction <- round(100 * (1 - nrow(high_corr_df_clean) / nrow(high_corr_df_raw)), 1)
+    cat("   High correlation reduction rate: %", reduction, "\n")
+  }
+}
+
+## =========================================================
+## 12) Train / Validation Split (Stratified)
+## =========================================================
+cat("\nTRAIN/VALIDATION SPLIT...\n")
+
+trainIndex <- createDataPartition(master_model$Status, p = 0.8, list = FALSE)
+train_data <- master_model[trainIndex, ]
+valid_data <- master_model[-trainIndex, ]
+
+cat("Train set size:", nrow(train_data), "\n")
+cat("Validation set size:", nrow(valid_data), "\n")
+cat("Train distribution:\n")
+print(table(train_data$Status))
+cat("Validation distribution:\n")
+print(table(valid_data$Status))
+
+## =========================================================
+## 13) One-Hot Encoding (ONLY ON TRAIN)
+## =========================================================
+cat("\nONE-HOT ENCODING...\n")
+
+dummies <- dummyVars(
+  ~ Region + Customer.Level + Vertical + Subvertical + Usage_Freq + Reporting_score,
+  data = train_data,
+  fullRank = TRUE
+)
+
+train_dummy <- predict(dummies, newdata = train_data) %>% as.data.frame()
+valid_dummy <- predict(dummies, newdata = valid_data) %>% as.data.frame()
+
+train_final <- bind_cols(
+  train_data %>% select(-all_of(cat_cols)),
+  train_dummy
+)
+
+valid_final <- bind_cols(
+  valid_data %>% select(-all_of(cat_cols)),
+  valid_dummy
+)
+
+cat("Train size after one-hot encoding:", dim(train_final), "\n")
+cat("Validation size after one-hot encoding:", dim(valid_final), "\n")
+
+## =========================================================
+## 14) Model Training
+## =========================================================
+cat("\n", strrep("=", 60), "\n")
+cat("MODEL TRAINING\n")
+cat(strrep("=", 60), "\n")
+
+# TrainControl
+set.seed(42)
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  savePredictions = "final",
+  summaryFunction = multiClassSummary,
+  verboseIter = FALSE
+)
+
+# IMPORTANT: NA value check in train_final
+cat("\nNA VALUE CHECK...\n")
+na_count <- sum(is.na(train_final))
+cat("Total NA count in train_final:", na_count, "\n")
+
+if (na_count > 0) {
+  cat("NA values found! Correcting...\n")
+  
+  # Check and correct NA values
+  na_columns <- colnames(train_final)[apply(train_final, 2, function(x) any(is.na(x)))]
+  cat("Columns containing NA:", paste(na_columns, collapse = ", "), "\n")
+  
+  # Fill NA values
+  numeric_cols <- sapply(train_final, is.numeric)
+  for (col in na_columns) {
+    if (numeric_cols[col]) {
+      train_final[[col]][is.na(train_final[[col]])] <- median(train_final[[col]], na.rm = TRUE)
+      cat("  -", col, ": NA values filled with median\n")
+    }
+  }
+  
+  # Do the same for valid_final if it exists
+  if (exists("valid_final")) {
+    for (col in na_columns) {
+      if (col %in% colnames(valid_final)) {
+        if (numeric_cols[col]) {
+          valid_final[[col]][is.na(valid_final[[col]])] <- median(valid_final[[col]], na.rm = TRUE)
+        }
+      }
+    }
+    cat("NA corrections also applied to valid_final\n")
+  }
+  
+  # Re-check NA count
+  na_count_after <- sum(is.na(train_final))
+  cat("Total NA in train_final after correction:", na_count_after, "\n")
+}
+
+# 1) RANDOM FOREST
+cat("\nRANDOM FOREST TRAINING...\n")
+
+set.seed(42)
+tryCatch({
+  rf_model <- train(
+    Status ~ .,
+    data = train_final,
+    method = "rf",
+    trControl = ctrl,
+    metric = "Accuracy",
+    tuneLength = 3,
+    importance = TRUE,
+    ntree = 200
+  )
+  
+  cat("Random Forest results:\n")
+  print(rf_model)
+  
+  # Prediction for validation
+  if (exists("valid_final") && sum(is.na(valid_final)) == 0) {
+    rf_pred <- predict(rf_model, newdata = valid_final)
+    cm_rf <- confusionMatrix(rf_pred, valid_final$Status)
+    print(cm_rf)
+  } else {
+    cat("Valid_final contains NA values or doesn't exist\n")
+  }
+  
+}, error = function(e) {
+  cat("Random Forest error:", e$message, "\n")
+})
+
+# 2) LOGISTIC REGRESSION
+cat("\nLOGISTIC REGRESSION TRAINING...\n")
+
+set.seed(42)
+tryCatch({
+  # NA check
+  if (sum(is.na(train_final)) == 0) {
+    log_model <- multinom(
+      Status ~ .,
+      data = train_final,
+      MaxNWts = 10000,
+      trace = FALSE
+    )
+    
+    log_pred <- predict(log_model, newdata = valid_final)
+    cm_log <- confusionMatrix(log_pred, valid_final$Status)
+    print(cm_log)
+  } else {
+    cat("Train_final contains NA values, skipping Logistic Regression\n")
+    log_model <- NULL
+  }
+}, error = function(e) {
+  cat("Logistic Regression error:", e$message, "\n")
+  log_model <- NULL
+})
+
+# 3) GBM
+cat("\nGBM TRAINING...\n")
+
+set.seed(42)
+ctrl_gbm <- trainControl(
+  method = "cv",
+  number = 3,
+  classProbs = TRUE,
+  savePredictions = "final",
+  summaryFunction = multiClassSummary,
+  verboseIter = FALSE
+)
+
+tryCatch({
+  # NA check
+  if (sum(is.na(train_final)) == 0) {
+    gbm_model <- train(
+      Status ~ .,
+      data = train_final,
+      method = "gbm",
+      trControl = ctrl_gbm,
+      metric = "Accuracy",
+      tuneGrid = expand.grid(
+        n.trees = c(100, 150),
+        interaction.depth = c(3, 5),
+        shrinkage = c(0.05, 0.1),
+        n.minobsinnode = 10
+      ),
+      verbose = FALSE
+    )
+    
+    gbm_pred <- predict(gbm_model, newdata = valid_final)
+    cm_gbm <- confusionMatrix(gbm_pred, valid_final$Status)
+    print(cm_gbm)
+  } else {
+    cat("Train_final contains NA values, skipping GBM\n")
+    gbm_model <- NULL
+  }
+}, error = function(e) {
+  cat("GBM error:", e$message, "\n")
+  gbm_model <- NULL
+})
+
+## =========================================================
+## 15) Performance Comparison
+## =========================================================
+cat("\n", strrep("=", 60), "\n")
+cat("MODEL PERFORMANCE COMPARISON\n")
+cat(strrep("=", 60), "\n")
+
+# Calculate performance with error control
+performance_comparison <- data.frame(
+  Model = c("Random Forest", "Logistic Regression", "GBM"),
+  Accuracy = NA_real_,
+  Kappa = NA_real_
+)
+
+# Random Forest performance
+if (exists("cm_rf") && !is.null(cm_rf$overall)) {
+  performance_comparison$Accuracy[1] <- ifelse("Accuracy" %in% names(cm_rf$overall), 
+                                               cm_rf$overall["Accuracy"], NA)
+  performance_comparison$Kappa[1] <- ifelse("Kappa" %in% names(cm_rf$overall), 
+                                            cm_rf$overall["Kappa"], NA)
+}
+
+# Logistic Regression performance
+if (exists("cm_log") && !is.null(cm_log$overall)) {
+  performance_comparison$Accuracy[2] <- ifelse("Accuracy" %in% names(cm_log$overall), 
+                                               cm_log$overall["Accuracy"], NA)
+  performance_comparison$Kappa[2] <- ifelse("Kappa" %in% names(cm_log$overall), 
+                                            cm_log$overall["Kappa"], NA)
+}
+
+# GBM performance
+if (exists("cm_gbm") && !is.null(cm_gbm$overall)) {
+  performance_comparison$Accuracy[3] <- ifelse("Accuracy" %in% names(cm_gbm$overall), 
+                                               cm_gbm$overall["Accuracy"], NA)
+  performance_comparison$Kappa[3] <- ifelse("Kappa" %in% names(cm_gbm$overall), 
+                                            cm_gbm$overall["Kappa"], NA)
+}
+
+performance_comparison$Accuracy <- round(performance_comparison$Accuracy, 4)
+performance_comparison$Kappa <- round(performance_comparison$Kappa, 4)
+
+cat("\nPERFORMANCE TABLE:\n")
+print(performance_comparison)
+
+# Best model (excluding NA values)
+valid_rows <- !is.na(performance_comparison$Accuracy)
+if (any(valid_rows)) {
+  best_model_idx <- which.max(performance_comparison$Accuracy[valid_rows])
+  best_model_name <- performance_comparison$Model[valid_rows][best_model_idx]
+  cat("\nBEST MODEL:", best_model_name, 
+      "\n   Accuracy:", performance_comparison$Accuracy[valid_rows][best_model_idx],
+      "\n   Kappa:", performance_comparison$Kappa[valid_rows][best_model_idx], "\n")
+} else {
+  cat("\nPerformance could not be calculated for any models\n")
+}
+
+# Model comparison graph (only with valid values)
+performance_long <- performance_comparison %>%
+  filter(!is.na(Accuracy)) %>%
+  pivot_longer(cols = c(Accuracy, Kappa), names_to = "Metric", values_to = "Value")
+
+if (nrow(performance_long) > 0) {
+  p_perf <- ggplot(performance_long, aes(x = Model, y = Value, fill = Metric)) +
+    geom_bar(stat = "identity", position = position_dodge()) +
+    geom_text(aes(label = sprintf("%.3f", Value)), 
+              position = position_dodge(width = 0.9), vjust = -0.5, size = 3.5) +
+    scale_fill_brewer(palette = "Set2") +
+    labs(
+      title = "Model Performance Comparison",
+      subtitle = "After Correlation Analysis Based Feature Engineering",
+      x = "Model",
+      y = "Value",
+      fill = "Metric"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5))
+  
+  print(p_perf)
+  ggsave(file.path(PROJECT_DIR, "model_performance_comparison_final.png"), 
+         plot = p_perf, width = 12, height = 8)
+}
+
+## =========================================================
+## 16) Feature Importance Analysis
+## =========================================================
+cat("\n", strrep("=", 60), "\n")
+cat("FEATURE IMPORTANCE ANALYSIS\n")
+cat(strrep("=", 60), "\n")
+
+# Random Forest feature importance
+if (exists("rf_model") && "finalModel" %in% names(rf_model)) {
+  tryCatch({
+    rf_importance <- varImp(rf_model, scale = TRUE)
+    
+    cat("\nRANDOM FOREST - TOP 20 IMPORTANT VARIABLES:\n")
+    
+    # Get importance values
+    imp_df <- as.data.frame(rf_importance$importance)
+    
+    # Add feature names
+    if (!"Feature" %in% colnames(imp_df)) {
+      imp_df$Feature <- rownames(imp_df)
+    }
+    
+    # Calculate overall importance
+    if (ncol(imp_df) > 2) {  # Multiple class case
+      imp_values <- imp_df[, 1:(ncol(imp_df)-1)]
+      imp_df$Overall <- rowMeans(imp_values, na.rm = TRUE)
+    } else if (ncol(imp_df) == 2) {
+      names(imp_df) <- c("Overall", "Feature")
+    }
+    
+    imp_df <- imp_df[order(-imp_df$Overall), ]
+    
+    # Short names
+    imp_df$Short_Name <- sapply(imp_df$Feature, function(x) {
+      if (nchar(x) > 40) paste0(substr(x, 1, 37), "...") else x
+    })
+    
+    top_20 <- head(imp_df, 20)
+    cat("\nTop 20 Feature Importance:\n")
+    print(top_20[, c("Feature", "Overall")])
+    
+    # Feature importance graph
+    if (nrow(top_20) > 0) {
+      p_imp <- ggplot(top_20, aes(x = reorder(Short_Name, Overall), y = Overall)) +
+        geom_bar(stat = "identity", fill = "steelblue", alpha = 0.8) +
+        coord_flip() +
+        labs(
+          title = "Top 20 Feature Importance (Random Forest)",
+          subtitle = "Correlation Analysis Based Model",
+          x = "Feature",
+          y = "Importance Score"
+        ) +
+        theme_minimal() +
+        theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+              plot.subtitle = element_text(hjust = 0.5))
+      
+      print(p_imp)
+      ggsave(file.path(PROJECT_DIR, "feature_importance_top20.png"), 
+             plot = p_imp, width = 12, height = 8)
+      
+      # Save as CSV
+      write.csv(imp_df, file.path(PROJECT_DIR, "feature_importance_all.csv"), row.names = FALSE)
+      write.csv(top_20, file.path(PROJECT_DIR, "feature_importance_top20.csv"), row.names = FALSE)
+      cat("\nFeature importance saved.\n")
+    }
+  }, error = function(e) {
+    cat("Feature importance could not be calculated:", e$message, "\n")
+  })
+}
+
+## =========================================================
+## 17) Save Objects (For Test Phase)
+## =========================================================
+cat("\n", strrep("=", 60), "\n")
+cat("SAVING OBJECTS...\n")
+cat(strrep("=", 60), "\n")
+
+save(
+  # Model objects
+  train_final,
+  dummies,
+  cat_cols,
+  rf_model,
+  log_model,
+  gbm_model,
+  
+  # Original data
+  master_train,
+  master_model,
+  
+  # Correlation analysis results
+  cor_matrix_raw,
+  cor_matrix_final,
+  cor_matrix_clean,
+  high_corr_df_raw,
+  high_corr_df_final,
+  high_corr_df_clean,
+  status_correlations_raw,
+  status_correlations_final,
+  status_correlations_clean,
+  
+  # Performance results
+  performance_comparison,
+  
+  file = file.path(PROJECT_DIR, "train_models_final.RData")
+)
+
+cat("\nCREATED FILES:\n")
+cat("1. train_models_final.RData - Main model objects\n")
+cat("2. correlation_raw_before_fe.png - Raw correlation heatmap\n")
+cat("3. correlation_final_after_fe.png - Post-feature engineering heatmap\n")
+cat("4. correlation_clean_after_removal.png - Post-cleaning heatmap\n")
+cat("5. high_correlation_raw.csv - Raw high correlations\n")
+cat("6. high_correlation_final.csv - Post-feature engineering high correlations\n")
+cat("7. high_correlation_clean.csv - Post-cleaning high correlations\n")
+cat("8. status_correlation.png - Status correlation graph\n")
+cat("9. status_correlation_clean.png - Post-cleaning status correlation\n")
+cat("10. new_features_correlation.png - New features correlation\n")
+cat("11. model_performance_comparison_final.png - Model performance\n")
+cat("12. feature_importance_top20.png - Feature importance\n")
+cat("13. feature_importance_all.csv - All feature importance\n")
+cat("14. feature_importance_top20.csv - Top 20 feature importance\n")
+
+## =========================================================
+## 18) Summary Report
+## =========================================================
+cat("\n", strrep("=", 60), "\n")
+cat("SUMMARY REPORT\n")
+cat(strrep("=", 60), "\n")
+
+cat("\nDATA SUMMARY:\n")
+cat("Total Customers:", nrow(master_train), "\n")
+cat("Train Set:", nrow(train_data), "\n")
+cat("Validation Set:", nrow(valid_data), "\n")
+cat("Total Features:", ncol(train_final) - 1, "\n")
+
+cat("\nCORRELATION ANALYSIS COMPARISON:\n")
+cat("1. Before Feature Engineering:", ncol(numeric_vars_raw), "variables\n")
+cat("2. After Feature Engineering:", ncol(numeric_vars_final), "variables\n")
+cat("3. After Cleaning:", ncol(numeric_vars_clean), "variables\n")
+
+if (exists("high_corr_df_raw") && exists("high_corr_df_clean")) {
+  cat("\nHIGH CORRELATION REDUCTION SUCCESS:\n")
+  cat("   Initial:", nrow(high_corr_df_raw), "high correlation pairs\n")
+  cat("   After Cleaning:", nrow(high_corr_df_clean), "high correlation pairs\n")
+  
+  if (nrow(high_corr_df_raw) > 0 && nrow(high_corr_df_clean) > 0) {
+    reduction <- round(100 * (1 - nrow(high_corr_df_clean) / nrow(high_corr_df_raw)), 1)
+    cat("   Reduction rate: %", reduction, "\n")
+  }
+}
+
+cat("\nNEW FEATURES:\n")
+cat("1. Satisfaction_Composite - Satisfaction composite score\n")
+cat("2. Support_Burden - Support burden\n")
+cat("3. Revenue_per_Month - Monthly revenue efficiency\n")
+cat("4. Bug_Frequency - Bug frequency\n")
+cat("5. Engagement_Ratio - Engagement ratio\n")
+cat("6. MRR_Ratio - MRR ratio\n")
+
+cat("\nMODEL RESULTS:\n")
+for (i in 1:nrow(performance_comparison)) {
+  if (!is.na(performance_comparison$Accuracy[i])) {
+    cat(sprintf("%-20s: Accuracy = %.3f, Kappa = %.3f\n", 
+                performance_comparison$Model[i],
+                performance_comparison$Accuracy[i],
+                performance_comparison$Kappa[i]))
+  }
+}
+
+cat("\n", strrep("=", 60), "\n")
+cat("TRAIN PHASE SUCCESSFULLY COMPLETED!\n")
+cat(strrep("=", 60), "\n")
+
+cat("\nCompletion Time:", Sys.time(), "\n")
+cat("Project Directory:", PROJECT_DIR, "\n")
+cat("Ready to proceed to test phase!\n")
+
+## =========================================================
+## 19) Advanced Train Visualizations (Different Techniques)
+## =========================================================
+cat("\n", strrep("=", 60), "\n")
+cat("GENERATING ADVANCED DIAGNOSTIC PLOTS\n")
+cat(strrep("=", 60), "\n")
+
+# 19.1 Lollipop Chart: Top 15 Variables by Status Correlation
+if (exists("status_correlations_clean")) {
+  p_lollipop <- status_correlations_clean %>%
+    head(15) %>%
+    ggplot(aes(x = reorder(Variable, Abs_Correlation), y = Correlation_with_Status)) +
+    geom_segment(aes(xend = Variable, yend = 0), color = "grey") +
+    geom_point(aes(color = Correlation_with_Status > 0), size = 4) +
+    scale_color_manual(values = c("TRUE" = "#2ecc71", "FALSE" = "#e74c3c"), 
+                       labels = c("Negative", "Positive"), name = "Correlation Dir.") +
+    coord_flip() +
+    labs(title = "Feature Influence on Customer Status",
+         subtitle = "Lollipop Chart: Strongest Predictors (Clean Data)",
+         x = "Features", y = "Correlation Coefficient") +
+    theme_minimal()
+  
+  print(p_lollipop)
+  ggsave(file.path(PROJECT_DIR, "train_lollipop_influence.png"), p_lollipop, width = 10, height = 7)
+}
+
+# 19.2 Radar Chart (Spider Plot) - Status Characterization
+cat("\nGenerating Status Profile Radar Analysis...\n")
+
+radar_data <- master_train %>%
+  group_by(Status) %>%
+  summarise(
+    Avg_Satisfaction = mean(Satisfaction_Composite, na.rm = TRUE),
+    Avg_Bug_Freq = mean(Bug_Frequency, na.rm = TRUE),
+    Avg_Engagement = mean(Engagement_Ratio, na.rm = TRUE),
+    Avg_Revenue = mean(Revenue_per_Month, na.rm = TRUE),
+    Avg_MRR_Ratio = mean(MRR_Ratio, na.rm = TRUE)
+  ) %>%
+  mutate(across(-Status, rescale)) # Normalize to 0-1 range
+
+radar_long <- radar_data %>%
+  pivot_longer(cols = -Status, names_to = "Metric", values_to = "Value")
+
+p_radar <- ggplot(radar_long, aes(x = Metric, y = Value, group = Status, color = Status)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  coord_polar() +
+  labs(title = "Customer Status Profiles",
+       subtitle = "Comparing normalized metrics across groups") +
+  theme_light() +
+  theme(axis.text.y = element_blank())
+
+print(p_radar)
+ggsave(file.path(PROJECT_DIR, "train_status_radar.png"), p_radar, width = 8, height = 8)
+
+## =========================================================
+## 20) Multi-Model Confusion Matrix Visualization
+## =========================================================
+cat("\n", strrep("=", 60), "\n")
+cat("GENERATING CONFUSION MATRICES FOR ALL MODELS\n")
+cat(strrep("=", 60), "\n")
+
+# Prepare model and CM list
+cm_list <- list()
+if (exists("cm_rf"))  cm_list[["Random_Forest"]] <- cm_rf
+if (exists("cm_log")) cm_list[["Logistic_Regression"]] <- cm_log
+if (exists("cm_gbm")) cm_list[["GBM"]] <- cm_gbm
+
+if (length(cm_list) > 0) {
+  for (model_name in names(cm_list)) {
+    
+    # 1. Prepare Data
+    cm_obj <- cm_list[[model_name]]
+    cm_df <- as.data.frame(cm_obj$table)
+    
+    # Calculate percentage values (for better analysis)
+    cm_df <- cm_df %>%
+      group_by(Reference) %>%
+      mutate(Pct = Freq / sum(Freq) * 100) %>%
+      ungroup()
+    
+    # 2. Visualization
+    p_cm_model <- ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+      geom_tile(color = "white", size = 1) +
+      geom_text(aes(label = sprintf("%d\n(%.1f%%)", Freq, Pct)), 
+                color = "white", fontface = "bold", size = 5) +
+      scale_fill_gradient(low = "#2c3e50", high = "#2980b9") +
+      labs(
+        title = paste("Confusion Matrix:", gsub("_", " ", model_name)),
+        subtitle = "Reference: Actual Values | Prediction: Model Guesses",
+        x = "Actual Status (Reference)",
+        y = "Predicted Status (Prediction)",
+        fill = "Count"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(face = "bold", size = 14),
+        axis.text = element_text(size = 11, face = "bold"),
+        panel.grid = element_blank()
+      )
+    
+    # 3. Print and Save
+    print(p_cm_model)
+    filename <- paste0("confusion_matrix_", tolower(model_name), ".png")
+    ggsave(file.path(PROJECT_DIR, filename), p_cm_model, width = 8, height = 6)
+    
+    cat("Saved:", filename, "\n")
+  }
+} else {
+  cat("No Confusion Matrix objects found (cm_rf, cm_log, or cm_gbm).\n")
+}
+
+## =========================================================
+## 21) Multi-Class ROC & AUC Analysis
+## =========================================================
+cat("\n", strrep("=", 60), "\n")
+cat("GENERATING ROC CURVES AND AUC SCORES\n")
+cat(strrep("=", 60), "\n")
+
+# Get prediction probabilities
+prob_list <- list()
+if (exists("rf_model"))  prob_list[["Random_Forest"]] <- predict(rf_model, newdata = valid_final, type = "prob")
+if (exists("log_model")) prob_list[["Logistic_Reg"]] <- predict(log_model, newdata = valid_final, type = "probs")
+if (exists("gbm_model")) prob_list[["GBM"]] <- predict(gbm_model, newdata = valid_final, type = "prob")
+
+# List to store ROC data
+roc_plot_data <- data.frame()
+
+if (length(prob_list) > 0) {
+  for (model_name in names(prob_list)) {
+    probs <- prob_list[[model_name]]
+    
+    # Calculate ROC for each class (One-vs-Rest)
+    classes <- levels(valid_final$Status)
+    
+    for (cl in classes) {
+      # Convert actual values to binary (Selected class vs Others)
+      binary_actual <- ifelse(valid_final$Status == cl, 1, 0)
+      current_prob <- probs[, cl]
+      
+      roc_obj <- roc(binary_actual, current_prob, quiet = TRUE)
+      
+      # Add to plot data
+      tmp_df <- data.frame(
+        Specificity = roc_obj$specificities,
+        Sensitivity = roc_obj$sensitivities,
+        Model = model_name,
+        Class = cl,
+        AUC = as.numeric(roc_obj$auc)
+      )
+      roc_plot_data <- rbind(roc_plot_data, tmp_df)
+    }
+  }
+  
+  # 1. Separate ROC for Each Class (Facet Wrap)
+  p_roc <- ggplot(roc_plot_data, aes(x = 1 - Specificity, y = Sensitivity, color = Model)) +
+    geom_line(size = 1.2) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey") +
+    facet_wrap(~Class) +
+    labs(
+      title = "Multi-class ROC Curves (One-vs-Rest)",
+      subtitle = "Performance comparison across different customer segments",
+      x = "False Positive Rate (1 - Specificity)",
+      y = "True Positive Rate (Sensitivity)"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
+  
+  print(p_roc)
+  ggsave(file.path(PROJECT_DIR, "train_multi_roc_curves.png"), p_roc, width = 12, height = 7)
+  
+  # 2. AUC Score Summary Table Visualization
+  auc_summary <- roc_plot_data %>%
+    group_by(Model, Class) %>%
+    summarise(AUC_Score = max(AUC), .groups = "drop")
+  
+  p_auc_bar <- ggplot(auc_summary, aes(x = Class, y = AUC_Score, fill = Model)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+    geom_text(aes(label = round(AUC_Score, 3)), 
+              position = position_dodge(width = 0.8), vjust = -0.5, size = 3) +
+    ylim(0, 1.1) +
+    labs(
+      title = "AUC Scores per Class and Model",
+      subtitle = "Values closer to 1.0 indicate better separation power",
+      x = "Customer Status Class",
+      y = "AUC Score"
+    ) +
+    theme_minimal()
+  
+  print(p_auc_bar)
+  ggsave(file.path(PROJECT_DIR, "train_auc_comparison.png"), p_auc_bar, width = 10, height = 6)
+  
+  cat("ROC and AUC analysis completed. Check your folder for .png files.\n")
+} else {
+  cat("Probabilities could not be retrieved for ROC analysis.\n")
+}
+cat("\nAdvanced visualizations saved to your project directory.\n")
+
+## =========================================================
+## 22) All Models Feature Importance Comparison
+## =========================================================
+cat("\n", strrep("=", 60), "\n")
+cat("GENERATING ALL-IN-ONE FEATURE IMPORTANCE COMPARISON\n")
+cat(strrep("=", 60), "\n")
+
+all_imp_data <- data.frame()
+
+# 1. Random Forest Importance
+if (exists("rf_model")) {
+  rf_imp <- varImp(rf_model, scale = TRUE)$importance
+  rf_df <- data.frame(
+    Feature = rownames(rf_imp),
+    Importance = rowMeans(rf_imp),
+    Model = "Random Forest"
+  )
+  all_imp_data <- rbind(all_imp_data, rf_df)
+}
+
+# 2. GBM Importance
+if (exists("gbm_model")) {
+  gbm_imp <- varImp(gbm_model, scale = TRUE)$importance
+  gbm_df <- data.frame(
+    Feature = rownames(gbm_imp),
+    Importance = gbm_imp$Overall,
+    Model = "GBM"
+  )
+  all_imp_data <- rbind(all_imp_data, gbm_df)
+}
+
+# 3. Logistic Regression (Absolute Coefficients as Proxy for Importance)
+if (exists("log_model") && !is.null(log_model)) {
+  # In logistic regression, absolute coefficient values represent importance
+  log_coefs <- abs(summary(log_model)$coefficients)
+  # If multiple classes, take average of coefficients
+  if (is.matrix(log_coefs)) {
+    log_imp_vals <- colMeans(log_coefs)
+  } else {
+    log_imp_vals <- log_coefs
+  }
+  
+  log_df <- data.frame(
+    Feature = names(log_imp_vals),
+    Importance = log_imp_vals,
+    Model = "Logistic Regression"
+  )
+  # Normalize to 0-100 scale
+  log_df$Importance <- (log_df$Importance / max(log_df$Importance)) * 100
+  all_imp_data <- rbind(all_imp_data, log_df %>% filter(Feature != "(Intercept)"))
+}
+
+# 4. Visualization
+if (nrow(all_imp_data) > 0) {
+  # Select top 15 features for each model
+  top_all_imp <- all_imp_data %>%
+    group_by(Model) %>%
+    arrange(desc(Importance)) %>%
+    slice_head(n = 15) %>%
+    ungroup()
+  
+  p_all_imp <- ggplot(top_all_imp, aes(x = reorder_within(Feature, Importance, Model), 
+                                       y = Importance, fill = Importance)) +
+    geom_bar(stat = "identity") +
+    scale_x_reordered() +
+    scale_fill_gradient(low = "#95a5a6", high = "#2c3e50") +
+    coord_flip() +
+    facet_wrap(~Model, scales = "free") +
+    labs(
+      title = "Feature Importance Comparison: All Models",
+      subtitle = "Top 15 features ranked by relative impact per model",
+      x = "Predictor Variables",
+      y = "Normalized Importance (0-100)"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 16),
+      strip.text = element_text(face = "bold", size = 12),
+      legend.position = "none"
+    )
+  
+  print(p_all_imp)
+  ggsave(file.path(PROJECT_DIR, "all_models_feature_importance.png"), 
+         plot = p_all_imp, width = 16, height = 9)
+  
+  cat("Combined Feature Importance chart saved: all_models_feature_importance.png\n")
+}
+
