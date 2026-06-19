@@ -1,195 +1,126 @@
-# 🎯 Customer Status Prediction
+# Customer Status Prediction
 
-> **Müşteri durumunu tahmin eden çok sınıflı bir makine öğrenmesi projesi — R ile geliştirildi.**
-
----
-
-## 📌 Proje Özeti
-
-Bu proje, B2B müşterilerin durumunu tahmin etmek için makine öğrenmesi modelleri geliştirmeyi amaçlamaktadır. Müşteri demografisi, gelir geçmişi, destek aktivitesi, memnuniyet anketleri ve daha fazlasını kapsayan **9 farklı veri kaynağı** birleştirilerek eğitim ve test aşamaları eksiksiz biçimde yürütülmektedir.
-
-### Hedef Sınıflar
-
-| Sınıf | Açıklama |
-|-------|----------|
-| 🔴 **Churn** | Müşteriyi kaybetme riski yüksek |
-| 🟡 **Onboarding** | Yeni veya alışma sürecindeki müşteri |
-| 🟢 **Retained** | Sadık, aktif müşteri |
+**Bartu Paçal & Begüm Başovalı**  
+Data Science Course Project — 2026
 
 ---
 
-## 📊 Model Performansı
+## About
+
+This is our data science course project where we tried to predict whether a customer will **churn**, stay **retained**, or be in **onboarding** using machine learning in R.
+
+We worked with 9 different data sources from a real B2B SaaS company and merged them together to build a single feature-rich dataset.
+
+---
+
+## The Problem
+
+Given historical data about a customer — their support tickets, satisfaction surveys, revenue, engagement, bug reports etc. — can we predict their current status?
+
+**Target classes:**
+- `Churn` — customer is at risk of leaving
+- `Retained` — customer is active and healthy
+- `Onboarding` — customer is new / still getting started
+
+The dataset had ~2,000 customers and was fairly imbalanced (~47% Churn, ~41% Retained, ~12% Onboarding).
+
+---
+
+## Data
+
+We used 9 CSV files that each contained a different piece of the puzzle:
+
+| File | What's in it |
+|------|-------------|
+| `customer_status_level` | Target variable + customer tier |
+| `customer_demographics` | Customer age in months |
+| `customer_monthly_recurring_revenue` | MRR |
+| `customer_region_and_industry` | Region, vertical, subvertical |
+| `customer_revenue_history` | Total historical revenue |
+| `customer_satisfaction_scores` | NPS, quality, usability scores |
+| `newsletter_engagement` | Newsletter interaction count |
+| `product_bug_reports` | Number of bug reports filed |
+| `support_ticket_activity` | Ticket count + resolution time |
+
+Not all customers appeared in every table (e.g. only ~200 had newsletter data), so we had to handle a lot of missing joins carefully.
+
+---
+
+## What We Did
+
+**1. Data Cleaning**
+Standardized ID column names across all tables, checked for duplicates, and flagged missing values.
+
+**2. EDA**
+Looked at distributions, class balance, and how each variable correlated with the target before touching the data.
+
+**3. Feature Engineering**
+We created 6 new features based on the correlation analysis:
+
+- `Satisfaction_Composite` — combined score from survey responses
+- `Support_Burden` — ticket volume relative to customer age
+- `Revenue_per_Month` — MRR efficiency
+- `Bug_Frequency` — bug reports over time
+- `Engagement_Ratio` — newsletter interaction rate
+- `MRR_Ratio` — MRR as a share of total revenue
+
+**4. Preprocessing**
+Median imputation for missing numerics, a `has_survey` flag for customers without survey data, one-hot encoding for categoricals, and multicollinearity check (dropped features with |r| > 0.8).
+
+**5. Modeling**
+We trained 3 models with 5-fold cross-validation:
+- Random Forest
+- Multinomial Logistic Regression
+- Gradient Boosting Machine (GBM)
+
+---
+
+## Results
 
 | Model | Accuracy | Kappa |
 |-------|----------|-------|
-| 🏆 **Random Forest** | **95.2%** | **0.919** |
-| GBM (Gradient Boosting) | 94.4% | 0.907 |
+| **Random Forest** | **95.2%** | **0.919** |
+| GBM | 94.4% | 0.907 |
 | Logistic Regression | 91.0% | 0.850 |
 
-> **En iyi model: Random Forest** — %95.2 doğruluk oranıyla production'a alınmıştır.
+Random Forest came out on top and was saved as the final model.
 
 ---
 
-## 🗂️ Veri Kaynakları
-
-Proje 9 farklı CSV dosyasını birleştirmektedir:
-
-| Dosya | İçerik |
-|-------|--------|
-| `customer_status_level` | Hedef değişken (Status) ve müşteri seviyesi |
-| `customer_demographics` | Müşteri yaşı (ay cinsinden) |
-| `customer_monthly_recurring_revenue` | Aylık yinelenen gelir (MRR) |
-| `customer_region_and_industry` | Bölge, dikey ve alt dikey bilgisi |
-| `customer_revenue_history` | Toplam gelir geçmişi |
-| `customer_satisfaction_scores` | NPS, kullanım sıklığı, kalite puanları |
-| `newsletter_engagement` | Bülten etkileşim sayısı |
-| `product_bug_reports` | Ürün hata rapor sayısı |
-| `support_ticket_activity` | Destek talebi sayısı ve çözüm süresi |
-
----
-
-## 🔬 Metodoloji
-
-### 1️⃣ Veri Ön İşleme
-- **ID hizalaması** — Tüm tablolarda `Customer.ID` standardizasyonu
-- **Eksik değer yönetimi** — Sayısal sütunlar için medyan imputation; anket yokluğu için `has_survey` bayrağı
-- **Duplikasyon kontrolü** — Her veri kümesi için benzersiz müşteri sayısı doğrulaması
-
-### 2️⃣ Keşifsel Veri Analizi (EDA)
-- Hedef değişken dağılımı incelemesi (%47 Churn, %41 Retained, %12 Onboarding)
-- Sayısal değişkenlerin korelasyon analizi (Feature Engineering öncesi ve sonrası)
-- Kategorik değişkenlerin dağılım grafikleri
-
-### 3️⃣ Özellik Mühendisliği (Feature Engineering)
-6 yeni özellik türetilmiştir:
-
-| Yeni Özellik | Açıklama |
-|---|---|
-| `Satisfaction_Composite` | Memnuniyet skorlarının ağırlıklı ortalaması |
-| `Support_Burden` | Destek talebi yoğunluk endeksi |
-| `Revenue_per_Month` | Aylık gelir verimliliği |
-| `Bug_Frequency` | Hata raporu sıklığı |
-| `Engagement_Ratio` | Bülten etkileşim oranı |
-| `MRR_Ratio` | MRR'ın toplam gelire oranı |
-
-### 4️⃣ Model Eğitimi
-- **5-katlı çapraz doğrulama** (5-fold Cross Validation)
-- `multiClassSummary` ile çok sınıflı metrik takibi
-- One-hot encoding (`dummyVars`) ile kategorik değişken dönüşümü
-- Çoklu bağlantısallık kontrolü (|r| > 0.8 eşiği)
-
-### 5️⃣ Model Değerlendirme
-- Confusion matrix (her model için ayrı ısı haritası)
-- One-vs-Rest ROC eğrileri ve AUC skorları
-- Accuracy & Kappa karşılaştırma grafikleri
-
----
-
-## 🗃️ Proje Yapısı
+## Project Structure
 
 ```
 Customer_Status_Prediction/
-│
-├── Train Datasets/          # Eğitim CSV dosyaları
-├── Test Datasets/           # Test CSV dosyaları
-│
-├── train.R                  # Eğitim pipeline'ı
-├── predict.R                # Test / tahmin pipeline'ı
-│
-├── train_models_final.RData # Kayıtlı modeller ve ön işleme nesneleri
-│
-├── confusion_matrix_random_forest.png
-├── confusion_matrix_logistic_regression.png
-├── confusion_matrix_gbm.png
-│
+├── Train Datasets/
+├── Test Datasets/
+├── train.R                    # training pipeline
+├── predict.R                  # prediction on test data
+├── train_models_final.RData   # saved models + preprocessing objects
 └── README.md
 ```
 
 ---
 
-## ⚙️ Kullanılan Kütüphaneler
+## How to Run
+
+First run the training script:
 
 ```r
-library(dplyr)        # Veri manipülasyonu
-library(tidyr)        # Veri temizleme
-library(caret)        # Makine öğrenmesi framework'ü
-library(ggplot2)      # Görselleştirme
-library(randomForest) # Random Forest modeli
-library(nnet)         # Lojistik regresyon (çok sınıflı)
-library(gbm)          # Gradient Boosting Machine
-library(corrplot)     # Korelasyon matrisi görselleştirme
-library(pROC)         # ROC & AUC analizi
-library(tidytext)     # Metin işleme
-library(knitr)        # R Markdown desteği
-library(kableExtra)   # Gelişmiş tablo formatı
-```
-
----
-
-## 🚀 Kullanım
-
-### Eğitim
-
-```r
-# Proje dizinini ayarlayın
-PROJECT_DIR <- "C:/Users/Bartu/Desktop/Customer_Status_Prediction"
-
-# Eğitim scriptini çalıştırın
+PROJECT_DIR <- "path/to/Customer_Status_Prediction"
 source("train.R")
-# → train_models_final.RData dosyasını oluşturur
 ```
 
-### Tahmin
+This saves `train_models_final.RData`. Then run predictions:
 
 ```r
-# Eğitim tamamlandıktan sonra test pipeline'ını çalıştırın
 source("predict.R")
-# → train_models_final.RData dosyasını yükler ve test verisine uygular
-```
-
-> ⚠️ **Not:** Tahmin scriptini çalıştırmadan önce `train.R` tamamlanmış olmalı ve `train_models_final.RData` dosyası mevcut olmalıdır.
-
----
-
-## 🔁 Pipeline Akışı
-
-```
-Ham Veriler (9 CSV)
-       ↓
-  ID Standardizasyonu
-       ↓
-  Eksik Değer İşleme
-       ↓
-  EDA & Korelasyon Analizi
-       ↓
-  Feature Engineering (+6 yeni özellik)
-       ↓
-  Değişken Seçimi & One-Hot Encoding
-       ↓
-  Train/Validation Split
-       ↓
-  Model Eğitimi (RF + LogReg + GBM)
-       ↓
-  Değerlendirme (Confusion Matrix, ROC, AUC)
-       ↓
-  En İyi Model Kaydı (train_models_final.RData)
-       ↓
-  Test Verisi Üzerinde Tahmin
 ```
 
 ---
 
-## 📈 Çıktı Dosyaları
+## Libraries Used
 
-| Dosya | Açıklama |
-|---|---|
-| `train_models_final.RData` | Eğitilmiş modeller ve preprocessing nesneleri |
-| `confusion_matrix_*.png` | Her model için confusion matrix görselleştirmesi |
-| `roc_curves_*.png` | One-vs-Rest ROC eğrileri |
-| `auc_scores_*.png` | Model-sınıf bazlı AUC karşılaştırma grafikleri |
-| `new_features_correlation.png` | Yeni özelliklerin hedefle korelasyonu |
-
----
-
-*Bu proje, Bartu Paçal ve Begüm Başovalı tarafından geliştirilmiştir.*
-**Tarih:** 2025
+```r
+dplyr, tidyr, caret, ggplot2, randomForest, nnet, gbm,
+corrplot, pROC, tidytext, psych, scales, knitr, kableExtra
+```
