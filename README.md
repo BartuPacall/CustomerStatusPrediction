@@ -2,9 +2,6 @@
 
 > **Müşteri durumunu tahmin eden çok sınıflı bir makine öğrenmesi projesi — R ile geliştirildi.**
 
-**Yazarlar:** Bartu Paçal & Begüm Başovalı  
-**Tarih:** 2025
-
 ---
 
 ## 📌 Proje Özeti
@@ -195,3 +192,4 @@ Ham Veriler (9 CSV)
 ---
 
 *Bu proje, Bartu Paçal ve Begüm Başovalı tarafından geliştirilmiştir.*
+**Tarih:** 2025
