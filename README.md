@@ -3,7 +3,7 @@
 > **Müşteri durumunu tahmin eden çok sınıflı bir makine öğrenmesi projesi — R ile geliştirildi.**
 
 **Yazarlar:** Bartu Paçal & Begüm Başovalı  
-**Tarih:** 2026
+**Tarih:** 2025
 
 ---
 
