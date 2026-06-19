@@ -1,7 +1,7 @@
 # Customer Status Prediction
 
 **Bartu Paçal & Begüm Başovalı**  
-Data Science Course Project — 2026
+Data Science Course Project — 2025
 
 ---
 
